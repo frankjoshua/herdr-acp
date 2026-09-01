@@ -1,0 +1,14 @@
+[project]
+name = "herdr-acp"
+version = "0.0.1"
+description = "Expose a Herdr pane as an ACP agent so bridges like buzz-acp can talk to whatever is running in it."
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["agent-client-protocol"]
+
+[project.scripts]
+herdr-acp = "herdr_acp.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
