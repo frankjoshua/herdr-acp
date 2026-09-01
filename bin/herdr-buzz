@@ -9,5 +9,5 @@ set -a; . "$HOME/.config/buzz-acp/agents/$name.env"; set +a
 here=$(cd "$(dirname "$0")/.." && pwd)
 exec "$HOME/buzz/target/release/buzz-acp" \
   --agent-command "$here/.venv/bin/herdr-acp" --agent-args="--pane,$pane" \
-  --channels "$channel" --subscribe all --no-mention-filter --relay-observer \
+  --channels "$channel" --subscribe all --kinds 9 --no-mention-filter --relay-observer \
   --idle-timeout 120 --multiple-event-handling queue "$@"
