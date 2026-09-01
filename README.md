@@ -14,4 +14,4 @@ Layers:
 - **reader** — what happened since the prompt. Claude transcript first; screen diff is the floor.
 - **acp** — the protocol server. Owns turn = prompt → reader stream → idle.
 
-Status: scaffold. See TODO.md in agent_workflow for the plan.
+Status: first slice works end to end (Claude + blank shell, via buzz-acp on the real relay). See NOTES.md.
