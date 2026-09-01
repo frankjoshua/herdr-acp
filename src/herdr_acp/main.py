@@ -17,7 +17,7 @@ from acp import (
 )
 from acp.schema import Implementation
 
-from .reader import ClaudeTranscript, ScreenDiff, transcript_path
+from .reader import ClaudeTranscript, ScreenDiff
 from .transport import Herdr, HerdrError
 
 log = logging.getLogger("herdr-acp")
@@ -57,7 +57,7 @@ class PaneAgent:
         info = await self.herdr.info()
         agent, sess = info.get("agent"), (info.get("agent_session") or {}).get("value")
         if agent == "claude" and sess:
-            reader = ClaudeTranscript(transcript_path(sess))
+            reader = ClaudeTranscript(sess)
             log.info("turn: claude transcript %s", reader.path)
 
             async def poll():

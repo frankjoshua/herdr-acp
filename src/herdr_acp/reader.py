@@ -83,13 +83,15 @@ def updates_from_entry(entry: dict) -> list:
 
 
 class ClaudeTranscript:
-    def __init__(self, path: str | None):
-        self.path = path
-        self.offset = os.path.getsize(path) if path and os.path.exists(path) else 0
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.path = transcript_path(session_id)  # None until Claude's first turn creates it
+        self.offset = os.path.getsize(self.path) if self.path else 0
         self.last_text = ""  # final assistant text of the turn, for --reply-from-output
 
     def poll(self) -> list:
-        if not self.path or not os.path.exists(self.path):
+        self.path = self.path or transcript_path(self.session_id)
+        if not self.path:
             return []
         with open(self.path, "rb") as f:
             f.seek(self.offset)
@@ -152,7 +154,9 @@ def _selfcheck() -> None:
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
         f.write(json.dumps({"type": "user", "message": {"content": "old"}}) + "\n")
         path = f.name
-    r = ClaudeTranscript(path)
+    r = ClaudeTranscript("selfcheck")
+    assert r.path is None and r.poll() == []
+    r.path, r.offset = path, os.path.getsize(path)
     assert r.poll() == []  # nothing after the offset
     with open(path, "a") as f:
         for e in lines:
