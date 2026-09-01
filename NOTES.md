@@ -1,6 +1,16 @@
 # NOTES
 
-## Run it
+## Run it (no desktop involved)
+```
+# once: Josh's owner nsec in ~/.config/buzz-acp/owner.env  (BUZZ_OWNER_NSEC=nsec1..., 0600)
+python -m herdr_acp.mint --name <agent> --channel <id>   # keypair + NIP-OA auth tag + profile + bot member
+# pane shell:  set -a; . ~/.config/buzz-acp/agents/<agent>.env; set +a   (before herdr agent start)
+# bridge pane: bin/herdr-buzz <agent> <pane> <channel> [--respond-to ...]
+```
+Verified 2026-09-01 with agent `herdr-test` (14525e4e…): buzz-acp logs "owner resolved from
+BUZZ_AUTH_TAG", replies post as the new agent, observer frames enabled.
+
+## Run it (old way, raw flags)
 ```
 # in its own pane in the target Space (never a service):
 set -a; . ~/.config/buzz-acp/agent.env; set +a
@@ -62,7 +72,9 @@ Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.transport <pane>
      the observer frames (`ownerByPubkey == me`). Only Buzz Desktop's create-agent flow mints one;
      no CLI does. Managed agents' `auth_tag` lives in
      `~/.local/share/xyz.block.buzz.app/agents/managed-agents.json`, the nsec in the OS keyring.
-     Decision pending with Josh: which identity the bridge runs under.
+     Josh's decision (2026-09-01): no desktop at all. His owner nsec lives on this box in
+     `owner.env`; `herdr_acp.mint` signs the tag itself (BIP-340 in stdlib Python, checked
+     against the NIP-OA test vector). Test-only key for now; he can rotate it any time.
 
 ## Assumed / not yet done
 - Cancel (`session/cancel` → Escape) is implemented but untested.
