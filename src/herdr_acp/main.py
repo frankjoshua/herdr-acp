@@ -23,12 +23,18 @@ from .transport import Herdr, HerdrError
 log = logging.getLogger("herdr-acp")
 POLL = 0.5
 GRACE = 10.0  # end an agent turn without ever seeing "working" only after this long idle
+# buzz-acp's prompt tells the agent to thread replies (--reply-to); Josh wants top-level posts.
+CHANNEL_FOOTER = (
+    "\n\n[herdr-acp] Override for this Buzz turn: post your reply as a top-level channel message, "
+    "i.e. `buzz messages send --channel <id> --content ...` WITHOUT `--reply-to`, unless the "
+    "human explicitly asked for a threaded reply."
+)
 
 
 class PaneAgent:
-    def __init__(self, pane: str, quiet: float, debounce: float):
+    def __init__(self, pane: str, quiet: float, debounce: float, reply: str = "channel"):
         self.herdr = Herdr(pane)
-        self.quiet, self.debounce = quiet, debounce
+        self.quiet, self.debounce, self.reply = quiet, debounce, reply
         self.conn = None
         self.cancelled = False
 
@@ -54,6 +60,8 @@ class PaneAgent:
 
     async def prompt(self, session_id: str, prompt: list, **kw):
         text = "\n".join(b.text for b in prompt if getattr(b, "type", None) == "text")
+        if self.reply == "channel" and "buzz messages send" in text:
+            text += CHANNEL_FOOTER
         info = await self.herdr.info()
         agent, sess = info.get("agent"), (info.get("agent_session") or {}).get("value")
         if agent == "claude" and sess:
@@ -103,11 +111,13 @@ def main() -> None:
     ap.add_argument("--pane", required=True, help="Herdr pane id, e.g. wV:p9")
     ap.add_argument("--quiet", type=float, default=5.0, help="shell turns end after N quiet seconds")
     ap.add_argument("--debounce", type=float, default=2.0, help="agent turns end N seconds after idle")
+    ap.add_argument("--reply", choices=["channel", "thread"], default="channel",
+                    help="where the pane agent is told to post its reply (default: channel)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(stream=sys.stderr, level=logging.DEBUG if a.verbose else logging.INFO,
                         format="herdr-acp %(levelname)s %(message)s")
-    asyncio.run(run_agent(PaneAgent(a.pane, a.quiet, a.debounce)))
+    asyncio.run(run_agent(PaneAgent(a.pane, a.quiet, a.debounce, a.reply)))
 
 
 if __name__ == "__main__":

@@ -15,7 +15,11 @@ Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.transport <pane>
 `python tests/roundtrip.py <pane> "pwd"`.
 
 ## Decisions
-- **No footer on prompts.** buzz-acp already puts `[Context] Channel: … (#uuid)`, thread root, and
+- **Reply goes to the channel, not a thread** (Josh, 2026-09-01). buzz-acp's prompt tells the agent
+  to `--reply-to` the trigger; there is no flag to turn that off, so `--reply channel` (default)
+  appends a short override footer; `--reply thread` sends the prompt untouched. Verified: reply
+  event has no `e` tag.
+- **No other footer on prompts.** buzz-acp already puts `[Context] Channel: … (#uuid)`, thread root, and
   "reply with `buzz messages send --reply-to <id>`" into every prompt (queue.rs `format_context_hints`),
   and the standing/base prompt arrives in the first prompt of a session. Claude replied threaded
   without any help from us. `--reply-from-output` (for blank shells) is still a follow-up.
