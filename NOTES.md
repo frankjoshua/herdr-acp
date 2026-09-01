@@ -48,6 +48,12 @@ Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.transport <pane>
 - DoD 4: blank shell `pwd` round-trips via screen diff (before Claude was started in the pane).
 - DoD 5: self-checks above.
 
+## Buzz UI facts (learned the hard way)
+- "View activity" (owner-only tool-call/thought transcript) only appears on members whose channel
+  role is `bot`. A key that *creates* a channel is `owner`, and cannot change its own role
+  (`missing p tag`); another admin/owner must set it: `buzz channels add-member --pubkey <agent> --role bot`.
+- Channels created by the agent key are invisible to Josh until he is added as a member.
+
 ## Assumed / not yet done
 - Cancel (`session/cancel` → Escape) is implemented but untested.
 - Interleaved turns (Josh typing mid-turn) untested; by design the turn just absorbs it.
