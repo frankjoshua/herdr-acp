@@ -54,6 +54,16 @@ Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.transport <pane>
   (`missing p tag`); another admin/owner must set it: `buzz channels add-member --pubkey <agent> --role bot`.
 - Channels created by the agent key are invisible to Josh until he is added as a member.
 
+- **Tool calls / thoughts in Buzz Desktop** show in the per-agent session panel (click the agent in a
+  channel), fed by relay observer frames (kind 24200, encrypted to the owner). Two prerequisites:
+  1. buzz-acp `--relay-observer` (now on in the test pane).
+  2. The agent key's kind:0 profile must carry a NIP-OA `auth` tag signed by Josh's owner key.
+     That is what turns "owner unavailable" into "managed by josh" AND what makes the desktop ingest
+     the observer frames (`ownerByPubkey == me`). Only Buzz Desktop's create-agent flow mints one;
+     no CLI does. Managed agents' `auth_tag` lives in
+     `~/.local/share/xyz.block.buzz.app/agents/managed-agents.json`, the nsec in the OS keyring.
+     Decision pending with Josh: which identity the bridge runs under.
+
 ## Assumed / not yet done
 - Cancel (`session/cancel` → Escape) is implemented but untested.
 - Interleaved turns (Josh typing mid-turn) untested; by design the turn just absorbs it.
