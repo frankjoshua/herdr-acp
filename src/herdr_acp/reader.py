@@ -34,6 +34,11 @@ def transcript_path(session_id: str) -> str | None:
     return max(hits, key=os.path.getmtime) if hits else None
 
 
+def newest_transcript() -> str | None:
+    hits = glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
 def _tool_title(name: str, inp: dict) -> str:
     arg = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("url") \
         or inp.get("description") or inp.get("prompt") or ""
@@ -87,10 +92,22 @@ class ClaudeTranscript:
         self.session_id = session_id
         self.path = transcript_path(session_id)  # None until Claude's first turn creates it
         self.offset = os.path.getsize(self.path) if self.path else 0
+        # Herdr's session id can go stale (pane cwd deleted, Claude restarted): if a different
+        # transcript grows before ours does, that is the live one.
+        self.alt = newest_transcript()
+        self.alt_size = os.path.getsize(self.alt) if self.alt else 0
         self.last_text = ""  # final assistant text of the turn, for --reply-from-output
 
+    def _resolve(self) -> None:
+        if self.alt and self.alt != self.path and os.path.getsize(self.alt) > self.alt_size:
+            self.path, self.offset = self.alt, self.alt_size
+        elif not self.path:
+            self.path = transcript_path(self.session_id)
+        if self.path and (self.path == self.alt or os.path.getsize(self.path) > self.offset):
+            self.alt = None  # decided
+
     def poll(self) -> list:
-        self.path = self.path or transcript_path(self.session_id)
+        self._resolve()
         if not self.path:
             return []
         with open(self.path, "rb") as f:
@@ -155,6 +172,7 @@ def _selfcheck() -> None:
         f.write(json.dumps({"type": "user", "message": {"content": "old"}}) + "\n")
         path = f.name
     r = ClaudeTranscript("selfcheck")
+    r.alt = None
     assert r.path is None and r.poll() == []
     r.path, r.offset = path, os.path.getsize(path)
     assert r.poll() == []  # nothing after the offset
@@ -171,7 +189,15 @@ def _selfcheck() -> None:
     with open(path, "a") as f:
         f.write('xt": "done"}]}}\n')
     assert [u.content.text for u in r.poll()] == ["done"]
-    os.unlink(path)
+    # stale session id: the file we were pointed at never grows, another one does
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f2:
+        live = f2.name
+    r = ClaudeTranscript("selfcheck")
+    r.path, r.offset, r.alt, r.alt_size = path, os.path.getsize(path), live, 0
+    with open(live, "a") as f:
+        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "live"}]}}) + "\n")
+    assert [u.content.text for u in r.poll()] == ["live"] and r.path == live
+    os.unlink(path); os.unlink(live)
 
     s = ScreenDiff("$ \n")
     assert s.feed("$ pwd\n/home/x\n$ \n")[0].content.text == "$ pwd\n/home/x\n"
