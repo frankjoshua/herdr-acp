@@ -2,11 +2,13 @@
 
 ClaudeTranscript tails ~/.claude/projects/*/<session>.jsonl from a byte offset.
 ScreenDiff diffs successive plain-text screen snapshots (floor for shells / unknown agents).
+Both expose `async poll() -> list[update]`.
 """
 
 import difflib
 import glob
 import json
+import logging
 import os
 import re
 
@@ -20,6 +22,9 @@ from acp import (
     update_user_message_text,
 )
 
+log = logging.getLogger("herdr-acp")
+PROJECTS = os.path.expanduser("~/.claude/projects")
+
 TOOL_KIND = {
     "Bash": "execute", "Read": "read", "Edit": "edit", "Write": "edit", "NotebookEdit": "edit",
     "MultiEdit": "edit", "Grep": "search", "Glob": "search", "WebFetch": "fetch",
@@ -31,12 +36,12 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]")
 
 def transcript_path(session_id: str) -> str | None:
     # ponytail: glob by session id instead of re-deriving Claude's cwd->dirname mangling
-    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
+    hits = glob.glob(os.path.join(PROJECTS, "*", f"{session_id}.jsonl"))
     return max(hits, key=os.path.getmtime) if hits else None
 
 
-def newest_transcript() -> str | None:
-    hits = glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))
+def newest_transcript(project_dir: str) -> str | None:
+    hits = glob.glob(os.path.join(project_dir, "*.jsonl"))
     return max(hits, key=os.path.getmtime) if hits else None
 
 
@@ -98,10 +103,9 @@ class ClaudeTranscript:
         self.path = transcript_path(session_id)  # None until Claude's first turn creates it
         self.offset = os.path.getsize(self.path) if self.path else 0
         # Herdr's session id can go stale (pane cwd deleted, Claude restarted): if a different
-        # transcript grows before ours does, that is the live one.
-        self.alt = newest_transcript()
+        # transcript in the same project grows before ours does, that is the live one.
+        self.alt = newest_transcript(os.path.dirname(self.path)) if self.path else None
         self.alt_size = os.path.getsize(self.alt) if self.alt else 0
-        self.last_text = ""  # final assistant text of the turn, for --reply-from-output
 
     def _resolve(self) -> None:
         if self.alt and self.alt != self.path and os.path.getsize(self.alt) > self.alt_size:
@@ -111,7 +115,7 @@ class ClaudeTranscript:
         if self.path and (self.path == self.alt or os.path.getsize(self.path) > self.offset):
             self.alt = None  # decided
 
-    def poll(self) -> list:
+    async def poll(self) -> list:
         self._resolve()
         if not self.path:
             return []
@@ -120,52 +124,57 @@ class ClaudeTranscript:
             data = f.read()
         if not data.endswith(b"\n"):  # partial line: leave it for next poll
             data = data[: data.rfind(b"\n") + 1]
-        self.offset += len(data)
         out = []
-        for line in data.decode("utf-8", "replace").splitlines():
+        for line in data.splitlines(keepends=True):
             try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ups = updates_from_entry(entry)
-            for u in ups:
-                if u.session_update == "agent_message_chunk":
-                    self.last_text = u.content.text
-            out.extend(ups)
+                out.extend(updates_from_entry(json.loads(line.decode("utf-8", "replace"))))
+            except Exception as e:  # one bad line (torn json, odd shape) must not cost the rest
+                log.warning("transcript %s: skipped line: %r", self.path, e)
+            self.offset += len(line)
         return out
 
 
 class ScreenDiff:
     """Emit lines that appeared since the last snapshot. Blank-shell floor."""
 
-    def __init__(self, first_screen: str = ""):
-        self.prev = self._lines(first_screen)
-        self.last_text = ""
+    def __init__(self, read_screen):
+        self.read_screen = read_screen  # async () -> str
+        self.prev = None  # the first screen is only a baseline
 
     @staticmethod
     def _lines(screen: str) -> list[str]:
         return [ln.rstrip() for ln in ANSI.sub("", screen).splitlines()]
 
+    async def poll(self) -> list:
+        return self.feed(await self.read_screen())
+
     def feed(self, screen: str) -> list:
-        cur = self._lines(screen)
+        cur, prev = self._lines(screen), self.prev
+        self.prev = cur
+        if prev is None:
+            return []
         new = []
-        for op, _, _, j1, j2 in difflib.SequenceMatcher(None, self.prev, cur, autojunk=False).get_opcodes():
+        for op, _, _, j1, j2 in difflib.SequenceMatcher(None, prev, cur, autojunk=False).get_opcodes():
             if op in ("insert", "replace"):
                 new.extend(ln for ln in cur[j1:j2] if ln.strip())
-        self.prev = cur
-        if not new:
-            return []
-        text = "\n".join(new) + "\n"
-        self.last_text += text
-        return [update_agent_message_text(text)]
+        return [update_agent_message_text("\n".join(new) + "\n")] if new else []
 
 
 def _selfcheck() -> None:
+    import asyncio
     import tempfile
+
+    def append(path, *entries):
+        with open(path, "a") as f:
+            for e in entries:
+                f.write(e if isinstance(e, str) else json.dumps(e) + "\n")
+
+    def text(entry_text):
+        return {"type": "assistant", "message": {"content": [{"type": "text", "text": entry_text}]}}
 
     lines = [
         {"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "hmm"}]}},
-        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hello"}]}},
+        text("hello"),
         {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pwd"}}]}},
         {"type": "user", "message": {"content": [
@@ -173,40 +182,55 @@ def _selfcheck() -> None:
         {"type": "assistant", "isSidechain": True, "message": {"content": [{"type": "text", "text": "sub"}]}},
         {"type": "user", "message": {"content": "typed by human"}},
     ]
-    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-        f.write(json.dumps({"type": "user", "message": {"content": "old"}}) + "\n")
-        path = f.name
-    r = ClaudeTranscript("selfcheck")
-    r.alt = None
-    assert r.path is None and r.poll() == []
-    r.path, r.offset = path, os.path.getsize(path)
-    assert r.poll() == []  # nothing after the offset
-    with open(path, "a") as f:
-        for e in lines:
-            f.write(json.dumps(e) + "\n")
-        f.write('{"type": "assistant", "message": {"content": [{"type": "text", "te')  # partial
-    ups = r.poll()
-    kinds = [u.session_update for u in ups]
-    assert kinds == ["agent_thought_chunk", "agent_message_chunk", "tool_call", "tool_call_update", "user_message_chunk"], kinds
-    assert ups[4].content.text == "typed by human"
-    assert updates_from_entry({"type": "user", "message": {"content": "<command-name>/clear</command-name>"}}) == []
-    assert ups[2].title == "Bash: pwd" and ups[2].kind == "execute"
-    assert ups[3].status == "completed" and ups[3].content[0].content.text == "/tmp"
-    assert r.last_text == "hello"
-    with open(path, "a") as f:
-        f.write('xt": "done"}]}}\n')
-    assert [u.content.text for u in r.poll()] == ["done"]
-    # stale session id: the file we were pointed at never grows, another one does
-    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f2:
-        live = f2.name
-    r = ClaudeTranscript("selfcheck")
-    r.path, r.offset, r.alt, r.alt_size = path, os.path.getsize(path), live, 0
-    with open(live, "a") as f:
-        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "live"}]}}) + "\n")
-    assert [u.content.text for u in r.poll()] == ["live"] and r.path == live
-    os.unlink(path); os.unlink(live)
 
-    s = ScreenDiff("$ \n")
+    async def go(tmp):
+        global PROJECTS
+        PROJECTS = tmp
+        proj_a, proj_b = os.path.join(tmp, "projA"), os.path.join(tmp, "projB")
+        os.makedirs(proj_a); os.makedirs(proj_b)
+        sid = os.path.join(proj_a, "sid.jsonl")
+        # no transcript yet: nothing to tail, no fallback
+        r = ClaudeTranscript("sid")
+        assert r.path is None and r.alt is None and await r.poll() == []
+        # (a) normal tail: the sid file appears, is picked up, and is read from its offset on
+        append(sid, {"type": "user", "message": {"content": "old"}})
+        r = ClaudeTranscript("sid")
+        assert r.path == sid and await r.poll() == []  # nothing after the offset
+        append(sid, *lines, '{"type": "assistant", "message": {"content": [{"type": "text", "te')  # partial
+        ups = await r.poll()
+        kinds = [u.session_update for u in ups]
+        assert kinds == ["agent_thought_chunk", "agent_message_chunk", "tool_call", "tool_call_update", "user_message_chunk"], kinds
+        assert ups[4].content.text == "typed by human"
+        assert updates_from_entry({"type": "user", "message": {"content": "<command-name>/clear</command-name>"}}) == []
+        assert ups[2].title == "Bash: pwd" and ups[2].kind == "execute"
+        assert ups[3].status == "completed" and ups[3].content[0].content.text == "/tmp"
+        append(sid, 'xt": "done"}]}}\n')
+        assert [u.content.text for u in await r.poll()] == ["done"]
+        # a torn line is skipped, the lines around it still stream
+        append(sid, "{not json\n", text("after"))
+        assert [u.content.text for u in await r.poll()] == ["after"]
+        # (b) stale sid: it never grows, a newer file in the SAME project grows -> switch to it
+        live = os.path.join(proj_a, "live.jsonl")
+        append(live, text("earlier"))
+        os.utime(sid, (1, 1))  # sid is the older file
+        r = ClaudeTranscript("sid")
+        assert r.path == sid and r.alt == live, (r.path, r.alt)
+        assert await r.poll() == []
+        append(live, text("live"))
+        assert [u.content.text for u in await r.poll()] == ["live"] and r.path == live
+        # (c) a newer file in a DIFFERENT project is never adopted
+        other = os.path.join(proj_b, "other.jsonl")
+        append(other, text("other"))
+        r = ClaudeTranscript("sid")
+        assert r.alt == live, r.alt
+        append(other, text("more"))
+        assert await r.poll() == [] and r.path == sid
+
+    with tempfile.TemporaryDirectory() as tmp:
+        asyncio.run(go(tmp))
+
+    s = ScreenDiff(None)
+    assert s.feed("$ \n") == []
     assert s.feed("$ pwd\n/home/x\n$ \n")[0].content.text == "$ pwd\n/home/x\n"
     assert s.feed("$ pwd\n/home/x\n$ \n") == []
     assert s.feed("/home/x\n$ ls\n\x1b[31ma.txt\x1b[0m\n$ \n")[0].content.text == "$ ls\na.txt\n"

@@ -32,14 +32,15 @@ GRACE = 10.0  # end an agent turn without ever seeing "working" only after this 
 
 class PaneAgent:
     def __init__(self, transport, quiet: float, debounce: float, footer: str = ""):
-        self.herdr = transport  # anything with info/state/send_text/send_keys/read_screen
+        self.transport = transport
         self.quiet, self.debounce, self.footer = quiet, debounce, footer
         self.conn = None
         self.session_id = None
+        self.tail = None  # the _tail task
         self.reader = None
         self.agent, self.status = None, "unknown"
-        self.activity = 0.0  # monotonic time of the last update we streamed
-        self.typed = []  # recent prompt texts, so their transcript echo isn't re-streamed
+        self.last_update_at = 0.0  # monotonic time of the last update we streamed
+        self.recent_prompts = []  # so a prompt's transcript echo isn't re-streamed as user input
         self.cancelled = False
 
     def on_connect(self, conn):
@@ -52,59 +53,51 @@ class PaneAgent:
         )
 
     async def new_session(self, cwd: str, **kw):
-        await self.herdr.info()  # fail fast if the pane is gone
+        await self.transport.info()  # fail fast if the pane is gone
         self.session_id = str(uuid.uuid4())
-        asyncio.create_task(self._tail())
+        if self.tail and not self.tail.done():
+            self.tail.cancel()
+        self.tail = asyncio.create_task(self._tail())
         return NewSessionResponse(session_id=self.session_id)
 
     async def cancel(self, session_id: str, **kw):
         self.cancelled = True
         try:
-            await self.herdr.send_keys("esc")
+            await self.transport.send_keys("esc")
         except Exception as e:  # best effort, like _tail
             log.warning("cancel: %s", e)
 
-    async def _poll(self) -> list:
-        """Follow whatever is in the pane right now; swap readers if the agent (re)starts."""
-        self.agent, self.status, sess = await self.herdr.state()
-        if self.agent == "claude" and sess:
-            if not isinstance(self.reader, ClaudeTranscript) or self.reader.session_id != sess:
-                self.reader = ClaudeTranscript(sess)
-                log.info("tailing claude transcript %s", self.reader.path)
-            return self.reader.poll()
-        if not isinstance(self.reader, ScreenDiff):
-            self.reader = ScreenDiff(await self.herdr.read_screen())
-            log.info("tailing screen (agent=%s)", self.agent)
-            return []
-        return self.reader.feed(await self.herdr.read_screen())
-
     async def _tail(self) -> None:
+        """Follow whatever is in the pane right now; swap readers if the agent (re)starts."""
         while True:
             try:
-                for u in await self._poll():
-                    if u.session_update == "user_message_chunk" and u.content.text.strip() in self.typed:
+                self.agent, self.status, sess = await self.transport.state()
+                if self.agent == "claude" and sess:
+                    if not isinstance(self.reader, ClaudeTranscript) or self.reader.session_id != sess:
+                        self.reader = ClaudeTranscript(sess)
+                        log.info("tailing claude transcript %s", self.reader.path)
+                elif not isinstance(self.reader, ScreenDiff):
+                    self.reader = ScreenDiff(self.transport.read_screen)
+                    log.info("tailing screen (agent=%s)", self.agent)
+                for u in await self.reader.poll():
+                    if u.session_update == "user_message_chunk" and u.content.text.strip() in self.recent_prompts:
                         continue
                     await self.conn.session_update(self.session_id, u)
-                    self.activity = time.monotonic()
+                    self.last_update_at = time.monotonic()
             except Exception as e:  # ponytail: pane gone or herdr hiccup; keep tailing
                 log.warning("tail: %s", e)
             await asyncio.sleep(POLL)
 
-    async def prompt(self, session_id: str, prompt: list, **kw):
-        text = "\n".join(b.text for b in prompt if getattr(b, "type", None) == "text")
-        if self.footer:
-            text += "\n\n" + self.footer
-        self.typed = (self.typed + [text.strip()])[-5:]
-        self.cancelled = False
-        await self.herdr.send_text(text)
-        start = time.monotonic()
-        seen_working, idle_since, seen_activity = False, None, self.activity
+    async def _wait_turn_end(self, start: float) -> str:
+        """Agent turns end `debounce`s after idle once "working" was seen (or GRACE elapsed) and no
+        new updates arrived; shell turns end after `quiet`s with no new output."""
+        seen_working, idle_since, seen = False, None, self.last_update_at
         while True:
             await asyncio.sleep(POLL)
             now = time.monotonic()
             if self.cancelled:
-                return PromptResponse(stop_reason="cancelled")
-            fresh, seen_activity = self.activity > seen_activity, self.activity
+                return "cancelled"
+            fresh, seen = self.last_update_at > seen, self.last_update_at
             if self.agent:
                 if self.status == "working":
                     seen_working, idle_since = True, None
@@ -113,10 +106,19 @@ class PaneAgent:
                 settled = seen_working or now - start >= GRACE
                 if settled and not fresh and now - idle_since >= self.debounce:
                     break
-            elif now - start >= self.quiet and now - self.activity >= self.quiet:
+            elif now - start >= self.quiet and now - self.last_update_at >= self.quiet:
                 break
         log.info("turn done (%s)", "agent idle" if self.agent else "screen quiet")
-        return PromptResponse(stop_reason="end_turn")
+        return "end_turn"
+
+    async def prompt(self, session_id: str, prompt: list, **kw):
+        text = "\n".join(b.text for b in prompt if getattr(b, "type", None) == "text")
+        if self.footer:
+            text += "\n\n" + self.footer
+        self.recent_prompts = (self.recent_prompts + [text.strip()])[-5:]
+        self.cancelled = False
+        await self.transport.send_text(text)
+        return PromptResponse(stop_reason=await self._wait_turn_end(time.monotonic()))
 
 
 def main() -> None:
@@ -166,8 +168,9 @@ def _selfcheck() -> None:
     async def go():
         global POLL, GRACE
         POLL, GRACE = 0.01, 10.0  # (a) GRACE out of reach: only working->idle may end the turn
-        stop, dt, _ = await run(Fake([("fake", "working", None)] * 10 + [("fake", "idle", None)]), debounce=0.1)
+        stop, dt, a = await run(Fake([("fake", "working", None)] * 10 + [("fake", "idle", None)]), debounce=0.1)
         assert stop == "end_turn" and dt >= 0.1, (stop, dt)
+        assert a.agent == "fake" and a.status == "idle" and a.last_update_at == 0.0, (a.agent, a.status)
         GRACE = 0.05  # (b) never saw "working": ends after GRACE
         stop, dt, _ = await run(Fake([("fake", "idle", None)]))
         assert stop == "end_turn" and dt >= 0.05, (stop, dt)
@@ -175,6 +178,12 @@ def _selfcheck() -> None:
         stop, dt, a = await run(Fake([(None, "unknown", None)], ["$ \n", "$ pwd\n/tmp\n$ \n"]), quiet=0.1)
         assert stop == "end_turn" and dt >= 0.1, (stop, dt)
         assert [u.content.text for u in a.conn.ups if u.session_update == "agent_message_chunk"] == ["$ pwd\n/tmp\n"], a.conn.ups
+        assert isinstance(a.reader, ScreenDiff) and a.last_update_at > 0
+        # a second session/new replaces the tail task instead of stacking another
+        old = a.tail
+        await a.new_session("/tmp")
+        await asyncio.wait([old])
+        assert old.cancelled() and a.tail is not old and not a.tail.done()
         # (d) cancel mid-turn
         f = Fake([("fake", "working", None)])
         stop, _, _ = await run(f, mid=lambda ag, sid: ag.cancel(sid))

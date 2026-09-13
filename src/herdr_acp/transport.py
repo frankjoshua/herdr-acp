@@ -14,17 +14,19 @@ class HerdrError(RuntimeError):
     pass
 
 
-async def _run(*args: str, timeout: float | None = None) -> str:
+async def _run(*args: str, timeout: float = 10.0) -> str:
     proc = await asyncio.create_subprocess_exec(
         "herdr", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
+    cmd = f"herdr {' '.join(args[:3])}"
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError:
         proc.kill()
-        raise HerdrError(f"herdr {' '.join(args[:3])} timed out")
+        await proc.wait()
+        raise HerdrError(f"{cmd} timed out")
     if proc.returncode:
-        raise HerdrError((err or out).decode().strip())
+        raise HerdrError(f"{cmd}: {(err or out).decode().strip()}")
     return out.decode()
 
 
