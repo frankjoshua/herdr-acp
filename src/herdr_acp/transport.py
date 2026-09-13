@@ -43,6 +43,12 @@ class Herdr:
         return (p.get("agent"), p.get("agent_status", "unknown"),
                 (p.get("agent_session") or {}).get("value"), p.get("foreground_cwd") or p.get("cwd"))
 
+    async def process(self) -> tuple[int | None, str | None]:
+        """(pid, name) of the pane's foreground process, e.g. the running agent."""
+        r = json.loads(await _run("pane", "process-info", "--pane", self.pane))["result"]["process_info"]
+        procs = r.get("foreground_processes") or []
+        return (procs[0]["pid"], procs[0]["name"]) if procs else (None, None)
+
     async def send_text(self, text: str) -> None:
         await _run("pane", "send-text", self.pane, text)
         await asyncio.sleep(ENTER_GAP)
@@ -61,7 +67,8 @@ async def _selfcheck(pane: str) -> None:
     assert info["pane_id"] == pane, info
     agent, status, session, cwd = await h.state()
     assert isinstance(status, str), status
-    print("agent:", agent, "status:", status, "session:", session, "cwd:", cwd)
+    pid, name = await h.process()
+    print("agent:", agent, "status:", status, "session:", session, "cwd:", cwd, "process:", pid, name)
     screen = await h.read_screen(5)
     assert isinstance(screen, str)
     print("screen tail:", screen.strip().splitlines()[-1:] or "(blank)")

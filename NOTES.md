@@ -4,6 +4,14 @@ Buzz-specific notes moved to ../herdr-buzz/NOTES.md (2026-09-13).
 
 
 ## Decisions
+- **Transcript discovery reads the agent process, nothing else** (Josh, 2026-09-13: no hooks, no
+  extra setup, only at plugin trigger time). `herdr pane process-info` gives the foreground PID.
+  Claude: `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` (Claude writes it itself) holds sessionId + cwd;
+  transcript = `<cfg>/projects/<cwd with non-alphanumerics as '-'>/<sessionId>.jsonl`. Codex:
+  `/proc/<pid>/fd` names the open rollout; before the first turn, newest rollout in `$CODEX_HOME`
+  (from the process env) whose session_meta.cwd is the process cwd and which is younger than the
+  process. The tail re-checks the PID every 5s, so a restarted agent gets a fresh reader. All the
+  glob/mtime/session-id heuristics are gone.
 - **The pane is a shared session** (Josh, 2026-09-13; "like ccbot with Telegram"). From
   `session/new` on, herdr-acp tails the pane continuously and streams everything as
   `session/update`: a human typing in the pane → `user_message_chunk`, agent text, thoughts, tool
@@ -24,8 +32,7 @@ Buzz-specific notes moved to ../herdr-buzz/NOTES.md (2026-09-13).
   for `--debounce` (2s) with no new transcript lines, after `working` was seen at least once
   (or 10s grace if it never was — fast answers). `blocked` (permission prompt) ends the turn too;
   Josh unblocks in the pane. Shell panes: screen unchanged for `--quiet` (5s).
-- **Transcript located by glob** `~/.claude/projects/*/<session>.jsonl`, not by re-deriving Claude's
-  cwd mangling. The file doesn't exist until Claude's first turn, so it's resolved lazily per poll.
+
 - **Screen diff uses `difflib.SequenceMatcher`** on stripped lines; emits insert/replace lines.
   Good enough for shells; prompt-marker detection (ccgram shell_infra) only if this proves noisy.
 - **Sidechain (subagent) transcript entries are skipped.**
@@ -44,13 +51,7 @@ Buzz-specific notes moved to ../herdr-buzz/NOTES.md (2026-09-13).
 - DoD 4: blank shell `pwd` round-trips via screen diff (before Claude was started in the pane).
 - DoD 5: self-checks above.
 
-- **Codex reader** (2026-09-13): Herdr's reported Codex session id matches nothing on disk, so the
-  rollout (`~/.codex/sessions/Y/M/D/rollout-*.jsonl`) is found by `session_meta.cwd == pane cwd`,
-  newest first, rescanned every 5s so a new session in the same cwd is adopted. Only
-  `event_msg/item_completed` items are mapped (UserMessage, AgentMessage, Reasoning summary,
-  CommandExecution, FileChange, McpToolCall); sub-agent chatter and raw responses are ignored.
-  Codex writes CommandExecution only on completion, so `tool_call` and its update arrive together.
-  Verified live: `tests/roundtrip.py <codex pane> "Run pwd …"`.
+
 
 ## Assumed / not yet done
 - Cancel (`session/cancel` → Escape) is implemented but untested.

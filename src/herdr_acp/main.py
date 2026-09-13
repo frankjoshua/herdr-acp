@@ -22,7 +22,7 @@ from acp import (
 )
 from acp.schema import Implementation
 
-from .reader import ClaudeTranscript, CodexRollout, ScreenDiff
+from .reader import ClaudeTranscript, CodexRollout, ScreenDiff, claude_transcript_for
 from .transport import Herdr
 
 log = logging.getLogger("herdr-acp")
@@ -39,6 +39,7 @@ class PaneAgent:
         self.tail = None  # the _tail task
         self.reader = None
         self.agent, self.status = None, "unknown"
+        self.pid = None  # the agent process the current reader was built for
         self.last_update_at = 0.0  # monotonic time of the last update we streamed
         self.recent_prompts = []  # so a prompt's transcript echo isn't re-streamed as user input
         self.cancelled = False
@@ -67,22 +68,31 @@ class PaneAgent:
         except Exception as e:  # best effort, like _tail
             log.warning("cancel: %s", e)
 
+    async def _pick_reader(self) -> None:
+        """Key the reader on the agent process: a (re)started agent gets a fresh reader."""
+        pid, _ = await self.transport.process() if self.agent in ("claude", "codex") else (None, None)
+        if self.reader and pid == self.pid and (pid or isinstance(self.reader, ScreenDiff)):
+            return
+        self.pid = pid
+        if self.agent == "claude" and pid:
+            self.reader = ClaudeTranscript(claude_transcript_for(pid))
+            log.info("tailing claude transcript %s", self.reader.path)
+        elif self.agent == "codex" and pid:
+            self.reader = CodexRollout(pid)
+            log.info("tailing codex rollout %s", self.reader.path)
+        elif not isinstance(self.reader, ScreenDiff):
+            self.reader = ScreenDiff(self.transport.read_screen)
+            log.info("tailing screen (agent=%s)", self.agent)
+
     async def _tail(self) -> None:
         """Follow whatever is in the pane right now; swap readers if the agent (re)starts."""
+        tick = 0
         while True:
             try:
-                self.agent, self.status, sess, cwd = await self.transport.state()
-                if self.agent == "claude" and sess:
-                    if not isinstance(self.reader, ClaudeTranscript) or self.reader.session_id != sess:
-                        self.reader = ClaudeTranscript(sess)
-                        log.info("tailing claude transcript %s", self.reader.path)
-                elif self.agent == "codex" and cwd:
-                    if not isinstance(self.reader, CodexRollout) or self.reader.cwd != cwd:
-                        self.reader = CodexRollout(cwd)
-                        log.info("tailing codex rollout %s", self.reader.path)
-                elif not isinstance(self.reader, ScreenDiff):
-                    self.reader = ScreenDiff(self.transport.read_screen)
-                    log.info("tailing screen (agent=%s)", self.agent)
+                self.agent, self.status, _, _ = await self.transport.state()
+                if tick % 10 == 0 or self.reader is None:  # ponytail: process-info every 5s
+                    await self._pick_reader()
+                tick += 1
                 for u in await self.reader.poll():
                     if u.session_update == "user_message_chunk" and u.content.text.strip() in self.recent_prompts:
                         continue
@@ -148,6 +158,7 @@ def _selfcheck() -> None:
             self.states, self.screens, self.sent, self.keys = list(states), list(screens), [], []
         async def info(self): return {"pane_id": "fake"}
         async def state(self): return self.states.pop(0) if len(self.states) > 1 else self.states[0]
+        async def process(self): return (None, None)
         async def send_text(self, text): self.sent.append(text)
         async def send_keys(self, *keys): self.keys += keys
         async def read_screen(self, lines=200): return self.screens.pop(0) if len(self.screens) > 1 else self.screens[0]
