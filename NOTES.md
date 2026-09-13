@@ -1,35 +1,14 @@
 # NOTES
 
-## Run it (no desktop involved)
-```
-# once: Josh's owner nsec in ~/.config/buzz-acp/owner.env  (BUZZ_OWNER_NSEC=nsec1..., 0600)
-python -m herdr_acp.mint --name <agent> --channel <id>   # keypair + NIP-OA auth tag + profile + bot member
-# pane shell:  set -a; . ~/.config/buzz-acp/agents/<agent>.env; set +a   (before herdr agent start)
-# bridge pane: bin/herdr-buzz <agent> <pane> <channel> [--respond-to ...]
-```
-Verified 2026-09-01 with agent `herdr-test` (14525e4e…): buzz-acp logs "owner resolved from
-BUZZ_AUTH_TAG", replies post as the new agent, observer frames enabled.
+Buzz-specific notes moved to ../herdr-buzz/NOTES.md (2026-09-13).
 
-## Run it (old way, raw flags)
-```
-# in its own pane in the target Space (never a service):
-set -a; . ~/.config/buzz-acp/agent.env; set +a
-~/buzz/target/release/buzz-acp --agent-command $REPO/.venv/bin/herdr-acp --agent-args=--pane,<PANE> \
-  --subscribe all --no-mention-filter --agent-owner <josh-pubkey> --channels <channel-id> \
-  --idle-timeout 120 --multiple-event-handling queue
-```
-`--agent-args` is comma-delimited in clap (`--pane,w47:p1`); a quoted `"--pane w47:p1"` is rejected.
-The pane's process env must carry `BUZZ_PRIVATE_KEY`/`BUZZ_RELAY_URL` (`herdr workspace create --env ...`).
-
-Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.transport <pane>`,
-`python tests/roundtrip.py <pane> "pwd"`.
 
 ## Decisions
-- **Reply goes to the channel, not a thread** (Josh, 2026-09-01). buzz-acp's prompt tells the agent
-  to `--reply-to` the trigger; there is no flag to turn that off, so `--reply channel` (default)
-  appends a short override footer; `--reply thread` sends the prompt untouched. Verified: reply
-  event has no `e` tag.
-- **No other footer on prompts.** buzz-acp already puts `[Context] Channel: … (#uuid)`, thread root, and
+- **herdr-acp is client-agnostic** (Josh, 2026-09-13). Everything Buzz-specific lives in
+  `../herdr-buzz` (identity minting, buzz-acp launcher, Buzz UI notes). The only hook the client
+  gets is `--footer` / `HERDR_ACP_FOOTER`: text appended to every prompt (herdr-buzz uses it to
+  ask for top-level replies).
+- **No built-in footer.** buzz-acp already puts `[Context] Channel: … (#uuid)`, thread root, and
   "reply with `buzz messages send --reply-to <id>`" into every prompt (queue.rs `format_context_hints`),
   and the standing/base prompt arrives in the first prompt of a session. Claude replied threaded
   without any help from us. `--reply-from-output` (for blank shells) is still a follow-up.
@@ -57,24 +36,6 @@ Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.transport <pane>
   Typing indicator: buzz-acp logs `typing=true`; **not visually verified** (needs the phone app).
 - DoD 4: blank shell `pwd` round-trips via screen diff (before Claude was started in the pane).
 - DoD 5: self-checks above.
-
-## Buzz UI facts (learned the hard way)
-- "View activity" (owner-only tool-call/thought transcript) only appears on members whose channel
-  role is `bot`. A key that *creates* a channel is `owner`, and cannot change its own role
-  (`missing p tag`); another admin/owner must set it: `buzz channels add-member --pubkey <agent> --role bot`.
-- Channels created by the agent key are invisible to Josh until he is added as a member.
-
-- **Tool calls / thoughts in Buzz Desktop** show in the per-agent session panel (click the agent in a
-  channel), fed by relay observer frames (kind 24200, encrypted to the owner). Two prerequisites:
-  1. buzz-acp `--relay-observer` (now on in the test pane).
-  2. The agent key's kind:0 profile must carry a NIP-OA `auth` tag signed by Josh's owner key.
-     That is what turns "owner unavailable" into "managed by josh" AND what makes the desktop ingest
-     the observer frames (`ownerByPubkey == me`). Only Buzz Desktop's create-agent flow mints one;
-     no CLI does. Managed agents' `auth_tag` lives in
-     `~/.local/share/xyz.block.buzz.app/agents/managed-agents.json`, the nsec in the OS keyring.
-     Josh's decision (2026-09-01): no desktop at all. His owner nsec lives on this box in
-     `owner.env`; `herdr_acp.mint` signs the tag itself (BIP-340 in stdlib Python, checked
-     against the NIP-OA test vector). Test-only key for now; he can rotate it any time.
 
 ## Assumed / not yet done
 - Cancel (`session/cancel` → Escape) is implemented but untested.
