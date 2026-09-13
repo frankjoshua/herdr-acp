@@ -24,7 +24,8 @@ from acp import (
 
 log = logging.getLogger("herdr-acp")
 PROJECTS = os.path.expanduser("~/.claude/projects")
-CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
+# Codex homes: $CODEX_HOME plus every ~/.codex* (Josh runs one Codex per account, e.g. ~/.codex-personal)
+CODEX_HOMES = [h for h in [os.environ.get("CODEX_HOME")] if h] + glob.glob(os.path.expanduser("~/.codex*"))
 
 TOOL_KIND = {
     "Bash": "execute", "Read": "read", "Edit": "edit", "Write": "edit", "NotebookEdit": "edit",
@@ -146,7 +147,7 @@ class ClaudeTranscript:
         return out
 
 
-# ---- Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl ----------------------------------
+# ---- Codex: <codex home>/sessions/YYYY/MM/DD/rollout-*.jsonl ----------------------------------
 # Herdr's reported Codex session id matches nothing on disk, so the rollout is found by the
 # pane's cwd (session_meta.cwd). `event_msg`/`item_completed` items are the clean, high-level
 # record of what happened; everything else (raw responses, token counts, sub-agent chatter) is
@@ -154,7 +155,7 @@ class ClaudeTranscript:
 
 def codex_rollout(cwd: str, newer_than: float = 0.0) -> str | None:
     best = None
-    for f in glob.glob(f"{CODEX_SESSIONS}/*/*/*/rollout-*.jsonl"):
+    for f in (f for h in CODEX_HOMES for f in glob.glob(f"{h}/sessions/*/*/*/rollout-*.jsonl")):
         m = os.path.getmtime(f)
         if m <= newer_than or (best and m <= best[0]):
             continue
@@ -329,9 +330,9 @@ def _selfcheck() -> None:
     assert s.feed("$ pwd\n/home/x\n$ \n") == []
     assert s.feed("/home/x\n$ ls\n\x1b[31ma.txt\x1b[0m\n$ \n")[0].content.text == "$ ls\na.txt\n"
     # Codex: discovered by cwd, item_completed → updates, newer session in same cwd adopted
-    global CODEX_SESSIONS
-    CODEX_SESSIONS = tempfile.mkdtemp()
-    d = os.path.join(CODEX_SESSIONS, "2026", "09", "13"); os.makedirs(d)
+    global CODEX_HOMES
+    CODEX_HOMES = [tempfile.mkdtemp()]
+    d = os.path.join(CODEX_HOMES[0], "sessions", "2026", "09", "13"); os.makedirs(d)
     def rollout(name, cwd, items):
         rows = [{"type": "session_meta", "payload": {"cwd": cwd}}]
         rows += [{"type": "event_msg", "payload": {"type": "item_completed", "item": it}} for it in items]
