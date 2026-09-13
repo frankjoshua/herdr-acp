@@ -23,7 +23,7 @@ from acp import (
 from acp.schema import Implementation
 
 from .reader import ClaudeTranscript, ScreenDiff
-from .transport import Herdr, HerdrError
+from .transport import Herdr
 
 log = logging.getLogger("herdr-acp")
 POLL = 0.5
@@ -31,8 +31,8 @@ GRACE = 10.0  # end an agent turn without ever seeing "working" only after this 
 
 
 class PaneAgent:
-    def __init__(self, pane: str, quiet: float, debounce: float, footer: str = ""):
-        self.herdr = Herdr(pane)
+    def __init__(self, transport, quiet: float, debounce: float, footer: str = ""):
+        self.herdr = transport  # anything with info/state/send_text/send_keys/read_screen
         self.quiet, self.debounce, self.footer = quiet, debounce, footer
         self.conn = None
         self.session_id = None
@@ -61,14 +61,12 @@ class PaneAgent:
         self.cancelled = True
         try:
             await self.herdr.send_keys("esc")
-        except HerdrError as e:
+        except Exception as e:  # best effort, like _tail
             log.warning("cancel: %s", e)
 
     async def _poll(self) -> list:
         """Follow whatever is in the pane right now; swap readers if the agent (re)starts."""
-        info = await self.herdr.info()
-        self.agent, self.status = info.get("agent"), info.get("agent_status", "unknown")
-        sess = (info.get("agent_session") or {}).get("value")
+        self.agent, self.status, sess = await self.herdr.state()
         if self.agent == "claude" and sess:
             if not isinstance(self.reader, ClaudeTranscript) or self.reader.session_id != sess:
                 self.reader = ClaudeTranscript(sess)
@@ -132,8 +130,59 @@ def main() -> None:
     a = ap.parse_args()
     logging.basicConfig(stream=sys.stderr, level=logging.DEBUG if a.verbose else logging.INFO,
                         format="herdr-acp %(levelname)s %(message)s")
-    asyncio.run(run_agent(PaneAgent(a.pane, a.quiet, a.debounce, a.footer)))
+    asyncio.run(run_agent(PaneAgent(Herdr(a.pane), a.quiet, a.debounce, a.footer)))
+
+
+def _selfcheck() -> None:
+    """Turn-end rule against a scripted transport; no pane needed."""
+    from acp import text_block
+
+    class Fake:  # state()/read_screen() play their scripts, then repeat the last entry
+        def __init__(self, states, screens=("",)):
+            self.states, self.screens, self.sent, self.keys = list(states), list(screens), [], []
+        async def info(self): return {"pane_id": "fake"}
+        async def state(self): return self.states.pop(0) if len(self.states) > 1 else self.states[0]
+        async def send_text(self, text): self.sent.append(text)
+        async def send_keys(self, *keys): self.keys += keys
+        async def read_screen(self, lines=200): return self.screens.pop(0) if len(self.screens) > 1 else self.screens[0]
+
+    class Conn:
+        def __init__(self): self.ups = []
+        async def session_update(self, sid, u): self.ups.append(u)
+
+    async def run(fake, quiet=0.1, debounce=0.0, mid=None):
+        agent = PaneAgent(fake, quiet, debounce, footer="reply here")
+        agent.on_connect(Conn())
+        sid = (await agent.new_session("/tmp")).session_id
+        t = time.monotonic()
+        task = asyncio.create_task(agent.prompt(sid, [text_block("hi")]))
+        if mid:
+            await asyncio.sleep(0.03)
+            await mid(agent, sid)
+        r = await task
+        assert fake.sent == ["hi\n\nreply here"], fake.sent
+        return r.stop_reason, time.monotonic() - t, agent
+
+    async def go():
+        global POLL, GRACE
+        POLL, GRACE = 0.01, 10.0  # (a) GRACE out of reach: only working->idle may end the turn
+        stop, dt, _ = await run(Fake([("fake", "working", None)] * 10 + [("fake", "idle", None)]), debounce=0.1)
+        assert stop == "end_turn" and dt >= 0.1, (stop, dt)
+        GRACE = 0.05  # (b) never saw "working": ends after GRACE
+        stop, dt, _ = await run(Fake([("fake", "idle", None)]))
+        assert stop == "end_turn" and dt >= 0.05, (stop, dt)
+        # (c) shell: ends after `quiet` of unchanged screen; new lines were streamed
+        stop, dt, a = await run(Fake([(None, "unknown", None)], ["$ \n", "$ pwd\n/tmp\n$ \n"]), quiet=0.1)
+        assert stop == "end_turn" and dt >= 0.1, (stop, dt)
+        assert [u.content.text for u in a.conn.ups if u.session_update == "agent_message_chunk"] == ["$ pwd\n/tmp\n"], a.conn.ups
+        # (d) cancel mid-turn
+        f = Fake([("fake", "working", None)])
+        stop, _, _ = await run(f, mid=lambda ag, sid: ag.cancel(sid))
+        assert stop == "cancelled" and f.keys == ["esc"], (stop, f.keys)
+        print("main ok")
+
+    asyncio.run(go())
 
 
 if __name__ == "__main__":
-    main()
+    _selfcheck() if "--selfcheck" in sys.argv else main()

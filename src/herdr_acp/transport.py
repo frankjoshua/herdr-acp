@@ -35,14 +35,10 @@ class Herdr:
     async def info(self) -> dict:
         return json.loads(await _run("pane", "get", self.pane))["result"]["pane"]
 
-    async def agent(self) -> str | None:
-        return (await self.info()).get("agent")
-
-    async def status(self) -> str:
-        return (await self.info()).get("agent_status", "unknown")
-
-    async def session_id(self) -> str | None:
-        return ((await self.info()).get("agent_session") or {}).get("value")
+    async def state(self) -> tuple[str | None, str, str | None]:
+        """(agent, status, session_id) from one `pane get`."""
+        p = await self.info()
+        return p.get("agent"), p.get("agent_status", "unknown"), (p.get("agent_session") or {}).get("value")
 
     async def send_text(self, text: str) -> None:
         await _run("pane", "send-text", self.pane, text)
@@ -55,21 +51,14 @@ class Herdr:
     async def read_screen(self, lines: int = 200) -> str:
         return await _run("pane", "read", self.pane, "--lines", str(lines), "--format", "text")
 
-    async def wait(self, *until: str, timeout: float | None = None) -> str:
-        """Block until the pane's agent reaches one of `until`; returns the status seen."""
-        args = ["agent", "wait", self.pane]
-        for s in until:
-            args += ["--until", s]
-        if timeout is not None:
-            args += ["--timeout", str(int(timeout * 1000))]
-        return json.loads(await _run(*args))["result"]["agent"]["agent_status"]
-
 
 async def _selfcheck(pane: str) -> None:
     h = Herdr(pane)
     info = await h.info()
     assert info["pane_id"] == pane, info
-    print("agent:", await h.agent(), "status:", await h.status(), "session:", await h.session_id())
+    agent, status, session = await h.state()
+    assert isinstance(status, str), status
+    print("agent:", agent, "status:", status, "session:", session)
     screen = await h.read_screen(5)
     assert isinstance(screen, str)
     print("screen tail:", screen.strip().splitlines()[-1:] or "(blank)")
