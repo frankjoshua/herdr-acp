@@ -4,6 +4,13 @@ Buzz-specific notes moved to ../herdr-buzz/NOTES.md (2026-09-13).
 
 
 ## Decisions
+- **The pane is a shared session** (Josh, 2026-09-13; "like ccbot with Telegram"). From
+  `session/new` on, herdr-acp tails the pane continuously and streams everything as
+  `session/update`: a human typing in the pane → `user_message_chunk`, agent text, thoughts, tool
+  calls. Not only during a prompt. The echo of a prompt we typed ourselves is suppressed (last 5
+  prompt texts). A turn still ends on idle + debounce; "fresh activity" now comes from the tail.
+- The tail re-reads `herdr pane get` every poll, so if the agent in the pane restarts (new session
+  id) or a shell becomes an agent, the reader swaps automatically.
 - **herdr-acp is client-agnostic** (Josh, 2026-09-13). Everything Buzz-specific lives in
   `../herdr-buzz` (identity minting, buzz-acp launcher, Buzz UI notes). The only hook the client
   gets is `--footer` / `HERDR_ACP_FOOTER`: text appended to every prompt (herdr-buzz uses it to

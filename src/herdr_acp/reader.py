@@ -17,6 +17,7 @@ from acp import (
     update_agent_message_text,
     update_agent_thought_text,
     update_tool_call,
+    update_user_message_text,
 )
 
 TOOL_KIND = {
@@ -60,6 +61,10 @@ def updates_from_entry(entry: dict) -> list:
         return []  # ponytail: subagent traffic skipped; surface as nested tool_call later if wanted
     kind = entry.get("type")
     content = (entry.get("message") or {}).get("content")
+    if kind == "user" and isinstance(content, str):  # a human typed in the pane
+        text = content.strip()
+        # skip slash-command wrappers (<command-name>…) and interruption markers
+        return [update_user_message_text(text)] if text and not text.startswith(("<", "[Request interrupted")) else []
     if kind not in ("user", "assistant") or not isinstance(content, list):
         return []
     out = []
@@ -182,7 +187,9 @@ def _selfcheck() -> None:
         f.write('{"type": "assistant", "message": {"content": [{"type": "text", "te')  # partial
     ups = r.poll()
     kinds = [u.session_update for u in ups]
-    assert kinds == ["agent_thought_chunk", "agent_message_chunk", "tool_call", "tool_call_update"], kinds
+    assert kinds == ["agent_thought_chunk", "agent_message_chunk", "tool_call", "tool_call_update", "user_message_chunk"], kinds
+    assert ups[4].content.text == "typed by human"
+    assert updates_from_entry({"type": "user", "message": {"content": "<command-name>/clear</command-name>"}}) == []
     assert ups[2].title == "Bash: pwd" and ups[2].kind == "execute"
     assert ups[3].status == "completed" and ups[3].content[0].content.text == "/tmp"
     assert r.last_text == "hello"

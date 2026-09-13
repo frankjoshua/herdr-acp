@@ -1,8 +1,10 @@
 # herdr-acp
 
 Turns a Herdr pane into an [ACP](https://agentclientprotocol.com) agent. Any ACP client spawns
-`herdr-acp --pane <id>` over stdio; prompts get typed into the pane, and what the pane's agent
-does streams back as `session/update` until the pane goes idle, then the turn ends.
+`herdr-acp --pane <id>` over stdio. Prompts get typed into the pane; a turn ends when the pane
+goes idle. Everything that happens in the pane, whether a client prompted it or a human typed
+there, streams to the client as `session/update`, so the pane and the client are one shared
+session you can pick up from either side.
 
 ```
 ACP client  --stdio/ACP-->  herdr-acp  --herdr CLI-->  pane (claude / codex / pi / shell)
