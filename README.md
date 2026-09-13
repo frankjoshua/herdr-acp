@@ -13,7 +13,7 @@ ACP client  --stdio/ACP-->  herdr-acp  --herdr CLI-->  pane (claude / codex / pi
 
 Layers (`src/herdr_acp/`):
 - **transport.py** — send text, read screen, session id, status. Herdr via the `herdr` CLI.
-- **reader.py** — what happened since the prompt. Claude transcript first; screen diff is the floor.
+- **reader.py** — what happened in the pane. Claude transcript, Codex rollout; screen diff is the floor.
 - **main.py** — the ACP server. Turn = prompt → reader stream → idle → `end_turn`.
 
 Flags: `--quiet` (shell turn ends after N quiet seconds), `--debounce` (agent turn ends N seconds

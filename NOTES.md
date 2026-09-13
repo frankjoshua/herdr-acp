@@ -44,10 +44,18 @@ Buzz-specific notes moved to ../herdr-buzz/NOTES.md (2026-09-13).
 - DoD 4: blank shell `pwd` round-trips via screen diff (before Claude was started in the pane).
 - DoD 5: self-checks above.
 
+- **Codex reader** (2026-09-13): Herdr's reported Codex session id matches nothing on disk, so the
+  rollout (`~/.codex/sessions/Y/M/D/rollout-*.jsonl`) is found by `session_meta.cwd == pane cwd`,
+  newest first, rescanned every 5s so a new session in the same cwd is adopted. Only
+  `event_msg/item_completed` items are mapped (UserMessage, AgentMessage, Reasoning summary,
+  CommandExecution, FileChange, McpToolCall); sub-agent chatter and raw responses are ignored.
+  Codex writes CommandExecution only on completion, so `tool_call` and its update arrive together.
+  Verified live: `tests/roundtrip.py <codex pane> "Run pwd …"`.
+
 ## Assumed / not yet done
 - Cancel (`session/cancel` → Escape) is implemented but untested.
 - Interleaved turns (Josh typing mid-turn) untested; by design the turn just absorbs it.
 - `--reply-from-output` for blank shells: not written.
-- Codex / Pi readers: not written (screen diff is the floor for them today).
+- Pi reader: not written (screen diff is the floor for it today).
 - Claude's folder-trust dialog on a fresh cwd blocks `herdr agent start` (`agent_not_ready`); answer it
   by hand (Down, Enter) once per new directory.

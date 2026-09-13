@@ -24,6 +24,7 @@ from acp import (
 
 log = logging.getLogger("herdr-acp")
 PROJECTS = os.path.expanduser("~/.claude/projects")
+CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
 
 TOOL_KIND = {
     "Bash": "execute", "Read": "read", "Edit": "edit", "Write": "edit", "NotebookEdit": "edit",
@@ -97,6 +98,27 @@ def updates_from_entry(entry: dict) -> list:
     return out
 
 
+def _new_lines(path: str, offset: int) -> tuple[list[bytes], int]:
+    """Complete lines appended since `offset`; a torn trailing line waits for the next poll."""
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+    if not data.endswith(b"\n"):
+        data = data[: data.rfind(b"\n") + 1]
+    return data.splitlines(keepends=True), offset
+
+
+def _parse_lines(path: str, lines: list[bytes], offset: int, to_updates) -> tuple[list, int]:
+    out = []
+    for line in lines:
+        try:
+            out.extend(to_updates(json.loads(line.decode("utf-8", "replace"))))
+        except Exception as e:  # one bad line (torn json, odd shape) must not cost the rest
+            log.warning("transcript %s: skipped line: %r", path, e)
+        offset += len(line)
+    return out, offset
+
+
 class ClaudeTranscript:
     def __init__(self, session_id: str):
         self.session_id = session_id
@@ -119,18 +141,90 @@ class ClaudeTranscript:
         self._resolve()
         if not self.path:
             return []
-        with open(self.path, "rb") as f:
-            f.seek(self.offset)
-            data = f.read()
-        if not data.endswith(b"\n"):  # partial line: leave it for next poll
-            data = data[: data.rfind(b"\n") + 1]
-        out = []
-        for line in data.splitlines(keepends=True):
-            try:
-                out.extend(updates_from_entry(json.loads(line.decode("utf-8", "replace"))))
-            except Exception as e:  # one bad line (torn json, odd shape) must not cost the rest
-                log.warning("transcript %s: skipped line: %r", self.path, e)
-            self.offset += len(line)
+        lines, _ = _new_lines(self.path, self.offset)
+        out, self.offset = _parse_lines(self.path, lines, self.offset, updates_from_entry)
+        return out
+
+
+# ---- Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl ----------------------------------
+# Herdr's reported Codex session id matches nothing on disk, so the rollout is found by the
+# pane's cwd (session_meta.cwd). `event_msg`/`item_completed` items are the clean, high-level
+# record of what happened; everything else (raw responses, token counts, sub-agent chatter) is
+# ignored.
+
+def codex_rollout(cwd: str, newer_than: float = 0.0) -> str | None:
+    best = None
+    for f in glob.glob(f"{CODEX_SESSIONS}/*/*/*/rollout-*.jsonl"):
+        m = os.path.getmtime(f)
+        if m <= newer_than or (best and m <= best[0]):
+            continue
+        try:
+            with open(f) as fh:
+                meta = json.loads(fh.readline())
+        except Exception:
+            continue
+        if meta.get("type") == "session_meta" and (meta.get("payload") or {}).get("cwd") == cwd:
+            best = (m, f)
+    return best[1] if best else None
+
+
+def _item_text(content) -> str:
+    return "".join(c.get("text", "") for c in (content or []) if isinstance(c, dict) and c.get("type") in ("text", "Text"))
+
+
+def codex_updates(entry: dict) -> list:
+    """Map one rollout line to ACP updates (only `item_completed` events carry anything)."""
+    p = entry.get("payload") or {}
+    if entry.get("type") != "event_msg" or p.get("type") != "item_completed":
+        return []
+    it, kind, iid = p.get("item") or {}, (p.get("item") or {}).get("type"), (p.get("item") or {}).get("id", "")
+    if kind == "UserMessage":
+        text = _item_text(it.get("content")).strip()
+        return [update_user_message_text(text)] if text else []
+    if kind == "AgentMessage":
+        text = _item_text(it.get("content"))
+        return [update_agent_message_text(text)] if text.strip() else []
+    if kind == "Reasoning":
+        text = "\n".join(it.get("summary_text") or [])
+        return [update_agent_thought_text(text)] if text.strip() else []
+    if kind == "CommandExecution":
+        cmd = it.get("command") or []
+        cmd = cmd[2] if len(cmd) == 3 and cmd[1] in ("-lc", "-c") else " ".join(cmd)
+        out = (it.get("stdout") or "")[:4000]
+        failed = it.get("status") == "failed" or (it.get("exit_code") not in (None, 0))
+        return [start_tool_call(iid, f"exec: {cmd[:120]}", kind="execute", status="in_progress", raw_input={"command": cmd}),
+                update_tool_call(iid, status="failed" if failed else "completed",
+                                 content=[tool_content(text_block(out))] if out else None, raw_output=out or None)]
+    if kind == "FileChange":
+        paths = ", ".join(os.path.basename(x) for x in (it.get("changes") or {}))
+        return [start_tool_call(iid, f"edit: {paths[:120]}", kind="edit", status="in_progress"),
+                update_tool_call(iid, status="completed")]
+    if kind == "McpToolCall":
+        res = _item_text((it.get("result") or {}).get("content"))[:4000]
+        return [start_tool_call(iid, f"{it.get('server')}.{it.get('tool')}", kind="other", status="in_progress", raw_input=it.get("arguments")),
+                update_tool_call(iid, status="failed" if it.get("status") == "failed" else "completed",
+                                 content=[tool_content(text_block(res))] if res else None, raw_output=res or None)]
+    return []
+
+
+class CodexRollout:
+    def __init__(self, cwd: str):
+        self.cwd = cwd
+        self.path = codex_rollout(cwd)  # None until Codex writes its first rollout line
+        self.offset = os.path.getsize(self.path) if self.path else 0
+        self.checked = 0.0
+
+    async def poll(self) -> list:
+        import time
+        if time.monotonic() - self.checked >= 5:  # ponytail: rescan every 5s for a newer session in this cwd
+            self.checked = time.monotonic()
+            newer = codex_rollout(self.cwd, os.path.getmtime(self.path) if self.path else 0.0)
+            if newer and newer != self.path:
+                self.path, self.offset = newer, 0
+        if not self.path:
+            return []
+        lines, _ = _new_lines(self.path, self.offset)
+        out, self.offset = _parse_lines(self.path, lines, self.offset, codex_updates)
         return out
 
 
@@ -234,6 +328,38 @@ def _selfcheck() -> None:
     assert s.feed("$ pwd\n/home/x\n$ \n")[0].content.text == "$ pwd\n/home/x\n"
     assert s.feed("$ pwd\n/home/x\n$ \n") == []
     assert s.feed("/home/x\n$ ls\n\x1b[31ma.txt\x1b[0m\n$ \n")[0].content.text == "$ ls\na.txt\n"
+    # Codex: discovered by cwd, item_completed → updates, newer session in same cwd adopted
+    global CODEX_SESSIONS
+    CODEX_SESSIONS = tempfile.mkdtemp()
+    d = os.path.join(CODEX_SESSIONS, "2026", "09", "13"); os.makedirs(d)
+    def rollout(name, cwd, items):
+        rows = [{"type": "session_meta", "payload": {"cwd": cwd}}]
+        rows += [{"type": "event_msg", "payload": {"type": "item_completed", "item": it}} for it in items]
+        rows.append({"type": "event_msg", "payload": {"type": "token_count"}})
+        with open(os.path.join(d, name), "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+    rollout("rollout-1-a.jsonl", "/other", [{"type": "AgentMessage", "id": "x", "content": [{"type": "Text", "text": "wrong cwd"}]}])
+    rollout("rollout-2-b.jsonl", "/work", [])
+    c = CodexRollout("/work")
+    assert c.path.endswith("rollout-2-b.jsonl") and asyncio.run(c.poll()) == []
+    with open(c.path, "a") as f:
+        for it in [
+            {"type": "UserMessage", "id": "u1", "content": [{"type": "text", "text": "run pwd"}]},
+            {"type": "Reasoning", "id": "r1", "summary_text": ["thinking"]},
+            {"type": "CommandExecution", "id": "e1", "command": ["/bin/bash", "-lc", "pwd"], "status": "completed", "exit_code": 0, "stdout": "/work\n"},
+            {"type": "FileChange", "id": "f1", "changes": {"/work/a.py": {"type": "update"}}},
+            {"type": "AgentMessage", "id": "m1", "content": [{"type": "Text", "text": "done"}]},
+            {"type": "SubAgentActivity", "id": "s1"},
+        ]:
+            f.write(json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": it}}) + "\n")
+    ups = asyncio.run(c.poll())
+    assert [u.session_update for u in ups] == ["user_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
+                                              "tool_call", "tool_call_update", "agent_message_chunk"], [u.session_update for u in ups]
+    assert ups[2].title == "exec: pwd" and ups[3].content[0].content.text == "/work\n" and ups[4].title == "edit: a.py"
+    os.utime(c.path, (1, 1))  # make room for a strictly newer file
+    rollout("rollout-3-c.jsonl", "/work", [{"type": "AgentMessage", "id": "m2", "content": [{"type": "Text", "text": "new session"}]}])
+    c.checked = 0
+    assert [u.content.text for u in asyncio.run(c.poll())] == ["new session"] and c.path.endswith("rollout-3-c.jsonl")
     print("reader ok")
 
 

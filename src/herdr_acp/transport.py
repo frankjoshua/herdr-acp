@@ -37,10 +37,11 @@ class Herdr:
     async def info(self) -> dict:
         return json.loads(await _run("pane", "get", self.pane))["result"]["pane"]
 
-    async def state(self) -> tuple[str | None, str, str | None]:
-        """(agent, status, session_id) from one `pane get`."""
+    async def state(self) -> tuple[str | None, str, str | None, str | None]:
+        """(agent, status, session_id, cwd) from one `pane get`."""
         p = await self.info()
-        return p.get("agent"), p.get("agent_status", "unknown"), (p.get("agent_session") or {}).get("value")
+        return (p.get("agent"), p.get("agent_status", "unknown"),
+                (p.get("agent_session") or {}).get("value"), p.get("foreground_cwd") or p.get("cwd"))
 
     async def send_text(self, text: str) -> None:
         await _run("pane", "send-text", self.pane, text)
@@ -58,9 +59,9 @@ async def _selfcheck(pane: str) -> None:
     h = Herdr(pane)
     info = await h.info()
     assert info["pane_id"] == pane, info
-    agent, status, session = await h.state()
+    agent, status, session, cwd = await h.state()
     assert isinstance(status, str), status
-    print("agent:", agent, "status:", status, "session:", session)
+    print("agent:", agent, "status:", status, "session:", session, "cwd:", cwd)
     screen = await h.read_screen(5)
     assert isinstance(screen, str)
     print("screen tail:", screen.strip().splitlines()[-1:] or "(blank)")

@@ -22,7 +22,7 @@ from acp import (
 )
 from acp.schema import Implementation
 
-from .reader import ClaudeTranscript, ScreenDiff
+from .reader import ClaudeTranscript, CodexRollout, ScreenDiff
 from .transport import Herdr
 
 log = logging.getLogger("herdr-acp")
@@ -71,11 +71,15 @@ class PaneAgent:
         """Follow whatever is in the pane right now; swap readers if the agent (re)starts."""
         while True:
             try:
-                self.agent, self.status, sess = await self.transport.state()
+                self.agent, self.status, sess, cwd = await self.transport.state()
                 if self.agent == "claude" and sess:
                     if not isinstance(self.reader, ClaudeTranscript) or self.reader.session_id != sess:
                         self.reader = ClaudeTranscript(sess)
                         log.info("tailing claude transcript %s", self.reader.path)
+                elif self.agent == "codex" and cwd:
+                    if not isinstance(self.reader, CodexRollout) or self.reader.cwd != cwd:
+                        self.reader = CodexRollout(cwd)
+                        log.info("tailing codex rollout %s", self.reader.path)
                 elif not isinstance(self.reader, ScreenDiff):
                     self.reader = ScreenDiff(self.transport.read_screen)
                     log.info("tailing screen (agent=%s)", self.agent)
@@ -168,14 +172,14 @@ def _selfcheck() -> None:
     async def go():
         global POLL, GRACE
         POLL, GRACE = 0.01, 10.0  # (a) GRACE out of reach: only working->idle may end the turn
-        stop, dt, a = await run(Fake([("fake", "working", None)] * 10 + [("fake", "idle", None)]), debounce=0.1)
+        stop, dt, a = await run(Fake([("fake", "working", None, "/w")] * 10 + [("fake", "idle", None, "/w")]), debounce=0.1)
         assert stop == "end_turn" and dt >= 0.1, (stop, dt)
         assert a.agent == "fake" and a.status == "idle" and a.last_update_at == 0.0, (a.agent, a.status)
         GRACE = 0.05  # (b) never saw "working": ends after GRACE
-        stop, dt, _ = await run(Fake([("fake", "idle", None)]))
+        stop, dt, _ = await run(Fake([("fake", "idle", None, "/w")]))
         assert stop == "end_turn" and dt >= 0.05, (stop, dt)
         # (c) shell: ends after `quiet` of unchanged screen; new lines were streamed
-        stop, dt, a = await run(Fake([(None, "unknown", None)], ["$ \n", "$ pwd\n/tmp\n$ \n"]), quiet=0.1)
+        stop, dt, a = await run(Fake([(None, "unknown", None, "/w")], ["$ \n", "$ pwd\n/tmp\n$ \n"]), quiet=0.1)
         assert stop == "end_turn" and dt >= 0.1, (stop, dt)
         assert [u.content.text for u in a.conn.ups if u.session_update == "agent_message_chunk"] == ["$ pwd\n/tmp\n"], a.conn.ups
         assert isinstance(a.reader, ScreenDiff) and a.last_update_at > 0
@@ -185,7 +189,7 @@ def _selfcheck() -> None:
         await asyncio.wait([old])
         assert old.cancelled() and a.tail is not old and not a.tail.done()
         # (d) cancel mid-turn
-        f = Fake([("fake", "working", None)])
+        f = Fake([("fake", "working", None, "/w")])
         stop, _, _ = await run(f, mid=lambda ag, sid: ag.cancel(sid))
         assert stop == "cancelled" and f.keys == ["esc"], (stop, f.keys)
         print("main ok")
