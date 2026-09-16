@@ -70,14 +70,16 @@ class PaneAgent:
 
     async def _pick_reader(self) -> None:
         """Key the reader on the agent process: a (re)started agent gets a fresh reader."""
-        pid, _ = await self.transport.process() if self.agent in ("claude", "codex") else (None, None)
-        if self.reader and pid == self.pid and (pid or isinstance(self.reader, ScreenDiff)):
+        pid, name = await self.transport.process()
+        # Herdr may not detect an agent it can't see (e.g. codex inside tmux); the process name will.
+        kind = self.agent if self.agent in ("claude", "codex") else {"claude": "claude", "codex": "codex"}.get(name or "")
+        if self.reader and pid == self.pid and (kind or isinstance(self.reader, ScreenDiff)):
             return
         self.pid = pid
-        if self.agent == "claude" and pid:
+        if kind == "claude" and pid:
             self.reader = ClaudeTranscript(claude_transcript_for(pid))
             log.info("tailing claude transcript %s", self.reader.path)
-        elif self.agent == "codex" and pid:
+        elif kind == "codex" and pid:
             self.reader = CodexRollout(pid)
             log.info("tailing codex rollout %s", self.reader.path)
         elif not isinstance(self.reader, ScreenDiff):

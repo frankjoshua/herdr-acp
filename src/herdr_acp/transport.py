@@ -14,6 +14,23 @@ class HerdrError(RuntimeError):
     pass
 
 
+def tmux_socket(cmdline) -> str | None:
+    """The `-L <name>` socket of a tmux command line (string or argv)."""
+    parts = cmdline.split() if isinstance(cmdline, str) else list(cmdline)
+    for i, a in enumerate(parts):
+        if a == "-L" and i + 1 < len(parts):
+            return parts[i + 1]
+        if a.startswith("-L") and len(a) > 2:
+            return a[2:]
+    return None
+
+
+async def _run_argv(*argv: str, timeout: float = 10.0) -> str:
+    proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    return out.decode()
+
+
 async def _run(*args: str, timeout: float = 10.0) -> str:
     proc = await asyncio.create_subprocess_exec(
         "herdr", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -44,10 +61,22 @@ class Herdr:
                 (p.get("agent_session") or {}).get("value"), p.get("foreground_cwd") or p.get("cwd"))
 
     async def process(self) -> tuple[int | None, str | None]:
-        """(pid, name) of the pane's foreground process, e.g. the running agent."""
+        """(pid, name) of the pane's foreground process, e.g. the running agent. A tmux client
+        (the Codex desktop harness wraps codex in `tmux -L <socket>`) is resolved to the process
+        inside its pane."""
         r = json.loads(await _run("pane", "process-info", "--pane", self.pane))["result"]["process_info"]
         procs = r.get("foreground_processes") or []
-        return (procs[0]["pid"], procs[0]["name"]) if procs else (None, None)
+        if not procs:
+            return None, None
+        pid, name = procs[0]["pid"], procs[0]["name"]
+        if name.startswith("tmux"):
+            sock = tmux_socket(procs[0].get("cmdline") or procs[0].get("argv") or "")
+            if sock:
+                out = await _run_argv("tmux", "-L", sock, "list-panes", "-a", "-F", "#{pane_pid} #{pane_current_command}")
+                inner = out.split()
+                if len(inner) >= 2:
+                    return int(inner[0]), inner[1]
+        return pid, name
 
     async def send_text(self, text: str) -> None:
         await _run("pane", "send-text", self.pane, text)
@@ -67,6 +96,8 @@ async def _selfcheck(pane: str) -> None:
     assert info["pane_id"] == pane, info
     agent, status, session, cwd = await h.state()
     assert isinstance(status, str), status
+    assert tmux_socket("tmux -L codex-account-1 -f /dev/null new-session") == "codex-account-1"
+    assert tmux_socket(["tmux", "-Lfoo", "new"]) == "foo" and tmux_socket("bash") is None
     pid, name = await h.process()
     print("agent:", agent, "status:", status, "session:", session, "cwd:", cwd, "process:", pid, name)
     screen = await h.read_screen(5)

@@ -32,6 +32,7 @@ TOOL_KIND = {
 }
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]")
+NOISE = re.compile(r"[\s\u2800-\u28ff\u2500-\u257f\u2580-\u259f]*")  # only braille / box-drawing / blank
 
 
 def proc_info(pid: int) -> dict:
@@ -245,7 +246,8 @@ class ScreenDiff:
 
     @staticmethod
     def _lines(screen: str) -> list[str]:
-        return [ln.rstrip() for ln in ANSI.sub("", screen).splitlines()]
+        # spinner rows (braille dots, box art) change every frame and say nothing: drop them
+        return [ln.rstrip() for ln in ANSI.sub("", screen).splitlines() if not NOISE.fullmatch(ln)]
 
     async def poll(self) -> list:
         return self.feed(await self.read_screen())
@@ -321,6 +323,7 @@ def _selfcheck() -> None:
     assert s.feed("$ pwd\n/home/x\n$ \n")[0].content.text == "$ pwd\n/home/x\n"
     assert s.feed("$ pwd\n/home/x\n$ \n") == []
     assert s.feed("/home/x\n$ ls\n\x1b[31ma.txt\x1b[0m\n$ \n")[0].content.text == "$ ls\na.txt\n"
+    assert s.feed("/home/x\n$ ls\na.txt\n⠁    ⢀  ⠄\n─────\n$ \n") == []  # spinner frames are not output
     # Codex: rollout by cwd+home (pre-first-turn path), item_completed → updates
     home = tempfile.mkdtemp()
     d = os.path.join(home, "sessions", "2026", "09", "13"); os.makedirs(d)
