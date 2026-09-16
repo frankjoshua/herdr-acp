@@ -107,7 +107,6 @@ def updates_from_entry(entry: dict) -> list:
             out.append(update_tool_call(
                 b["tool_use_id"], status="failed" if b.get("is_error") else "completed",
                 content=[tool_content(text_block(text[:4000]))] if text else None,
-                raw_output=text[:4000] or None,
             ))
     return out
 
@@ -196,7 +195,7 @@ def codex_updates(entry: dict) -> list:
         failed = it.get("status") == "failed" or (it.get("exit_code") not in (None, 0))
         return [start_tool_call(iid, f"exec: {cmd[:120]}", kind="execute", status="in_progress", raw_input={"command": cmd}),
                 update_tool_call(iid, status="failed" if failed else "completed",
-                                 content=[tool_content(text_block(out))] if out else None, raw_output=out or None)]
+                                 content=[tool_content(text_block(out))] if out else None)]
     if kind == "FileChange":
         paths = ", ".join(os.path.basename(x) for x in (it.get("changes") or {}))
         return [start_tool_call(iid, f"edit: {paths[:120]}", kind="edit", status="in_progress"),
@@ -205,7 +204,7 @@ def codex_updates(entry: dict) -> list:
         res = _item_text((it.get("result") or {}).get("content"))[:4000]
         return [start_tool_call(iid, f"{it.get('server')}.{it.get('tool')}", kind="other", status="in_progress", raw_input=it.get("arguments")),
                 update_tool_call(iid, status="failed" if it.get("status") == "failed" else "completed",
-                                 content=[tool_content(text_block(res))] if res else None, raw_output=res or None)]
+                                 content=[tool_content(text_block(res))] if res else None)]
     return []
 
 
