@@ -5,8 +5,10 @@ A tmux transport later is a class with the same method names (duck typing, no AB
 
 import asyncio
 import json
+import logging
 import sys
 
+log = logging.getLogger("herdr-acp")
 ENTER_GAP = 0.5  # TUIs drop an Enter batched with the text; ccgram found 0.5s is enough
 
 
@@ -26,16 +28,9 @@ def tmux_socket(cmdline) -> str | None:
 
 
 async def _run_argv(*argv: str, timeout: float = 10.0) -> str:
+    """Run a command; stdout on success, HerdrError (naming the command) on timeout or nonzero exit."""
     proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, _ = await asyncio.wait_for(proc.communicate(), timeout)
-    return out.decode()
-
-
-async def _run(*args: str, timeout: float = 10.0) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "herdr", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    cmd = f"herdr {' '.join(args[:3])}"
+    cmd = " ".join(argv[:4])
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError:
@@ -47,6 +42,10 @@ async def _run(*args: str, timeout: float = 10.0) -> str:
     return out.decode()
 
 
+async def _run(*args: str) -> str:
+    return await _run_argv("herdr", *args)
+
+
 class Herdr:
     def __init__(self, pane: str):
         self.pane = pane
@@ -54,11 +53,10 @@ class Herdr:
     async def info(self) -> dict:
         return json.loads(await _run("pane", "get", self.pane))["result"]["pane"]
 
-    async def state(self) -> tuple[str | None, str, str | None, str | None]:
-        """(agent, status, session_id, cwd) from one `pane get`."""
+    async def state(self) -> tuple[str | None, str]:
+        """(agent, status) from one `pane get`."""
         p = await self.info()
-        return (p.get("agent"), p.get("agent_status", "unknown"),
-                (p.get("agent_session") or {}).get("value"), p.get("foreground_cwd") or p.get("cwd"))
+        return p.get("agent"), p.get("agent_status", "unknown")
 
     async def process(self) -> tuple[int | None, str | None]:
         """(pid, name) of the pane's foreground process, e.g. the running agent. A tmux client
@@ -72,7 +70,11 @@ class Herdr:
         if name.startswith("tmux"):
             sock = tmux_socket(procs[0].get("cmdline") or procs[0].get("argv") or "")
             if sock:
-                out = await _run_argv("tmux", "-L", sock, "list-panes", "-a", "-F", "#{pane_pid} #{pane_current_command}")
+                try:
+                    out = await _run_argv("tmux", "-L", sock, "list-panes", "-a", "-F", "#{pane_pid} #{pane_current_command}")
+                except HerdrError as e:  # no tmux, or the server is gone: Herdr's own view will do
+                    log.debug("tmux lookup: %s", e)
+                    out = ""
                 inner = out.split()
                 if len(inner) >= 2:
                     return int(inner[0]), inner[1]
@@ -94,19 +96,19 @@ async def _selfcheck(pane: str) -> None:
     h = Herdr(pane)
     info = await h.info()
     assert info["pane_id"] == pane, info
-    agent, status, session, cwd = await h.state()
+    agent, status = await h.state()
     assert isinstance(status, str), status
     assert tmux_socket("tmux -L codex-account-1 -f /dev/null new-session") == "codex-account-1"
     assert tmux_socket(["tmux", "-Lfoo", "new"]) == "foo" and tmux_socket("bash") is None
     pid, name = await h.process()
-    print("agent:", agent, "status:", status, "session:", session, "cwd:", cwd, "process:", pid, name)
+    print("agent:", agent, "status:", status, "process:", pid, name)
     screen = await h.read_screen(5)
     assert isinstance(screen, str)
     print("screen tail:", screen.strip().splitlines()[-1:] or "(blank)")
     try:
         await _run("pane", "get", "nope:p0")
     except HerdrError as e:
-        assert "not found" in str(e), e
+        assert "not found" in str(e) and str(e).startswith("herdr pane get nope:p0"), e
     print("transport ok")
 
 

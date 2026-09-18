@@ -1,8 +1,10 @@
 """Readers: "what happened in the pane since the prompt", as ACP session updates.
 
-ClaudeTranscript tails ~/.claude/projects/*/<session>.jsonl from a byte offset.
+ClaudeTranscript tails <cfg>/projects/<cwd>/<session>.jsonl from a byte offset.
+CodexRollout tails <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl the same way.
 ScreenDiff diffs successive plain-text screen snapshots (floor for shells / unknown agents).
-Both expose `async poll() -> list[update]`.
+All expose `async poll() -> list[update]`. `claude_transcript_for(pid)` / `codex_rollout_for(pid)`
+find the file from the agent process itself (`proc_info`).
 """
 
 import difflib
@@ -23,7 +25,8 @@ from acp import (
 )
 
 log = logging.getLogger("herdr-acp")
-PROC = "/proc"  # discovery reads the pane's own process: env, cwd, open files. No hooks, no globbing.
+PROC = "/proc"  # discovery is process-first (env, cwd, open files); the only glob is the cwd-scoped
+# fallback for a Codex that has not opened its rollout yet.
 
 TOOL_KIND = {
     "Bash": "execute", "Read": "read", "Edit": "edit", "Write": "edit", "NotebookEdit": "edit",
@@ -111,14 +114,14 @@ def updates_from_entry(entry: dict) -> list:
     return out
 
 
-def _new_lines(path: str, offset: int) -> tuple[list[bytes], int]:
+def _new_lines(path: str, offset: int) -> list[bytes]:
     """Complete lines appended since `offset`; a torn trailing line waits for the next poll."""
     with open(path, "rb") as f:
         f.seek(offset)
         data = f.read()
     if not data.endswith(b"\n"):
         data = data[: data.rfind(b"\n") + 1]
-    return data.splitlines(keepends=True), offset
+    return data.splitlines(keepends=True)
 
 
 def _parse_lines(path: str, lines: list[bytes], offset: int, to_updates) -> tuple[list, int]:
@@ -142,8 +145,7 @@ class ClaudeTranscript:
     async def poll(self) -> list:
         if not os.path.exists(self.path):
             return []
-        lines, _ = _new_lines(self.path, self.offset)
-        out, self.offset = _parse_lines(self.path, lines, self.offset, updates_from_entry)
+        out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, updates_from_entry)
         return out
 
 
@@ -162,7 +164,8 @@ def codex_rollout(cwd: str, home: str, newer_than: float = 0.0) -> str | None:
         try:
             with open(f) as fh:
                 meta = json.loads(fh.readline())
-        except Exception:
+        except (OSError, ValueError) as e:
+            log.debug("codex rollout %s skipped: %r", f, e)
             continue
         if meta.get("type") == "session_meta" and (meta.get("payload") or {}).get("cwd") == cwd:
             best = (m, f)
@@ -178,7 +181,8 @@ def codex_updates(entry: dict) -> list:
     p = entry.get("payload") or {}
     if entry.get("type") != "event_msg" or p.get("type") != "item_completed":
         return []
-    it, kind, iid = p.get("item") or {}, (p.get("item") or {}).get("type"), (p.get("item") or {}).get("id", "")
+    it = p.get("item") or {}
+    kind, iid = it.get("type"), it.get("id", "")
     if kind == "UserMessage":
         text = _item_text(it.get("content")).strip()
         return [update_user_message_text(text)] if text else []
@@ -230,8 +234,7 @@ class CodexRollout:
             self.path, self.offset = codex_rollout_for(self.pid), 0
         if not self.path:
             return []
-        lines, _ = _new_lines(self.path, self.offset)
-        out, self.offset = _parse_lines(self.path, lines, self.offset, codex_updates)
+        out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, codex_updates)
         return out
 
 

@@ -26,6 +26,7 @@ from .reader import ClaudeTranscript, CodexRollout, ScreenDiff, claude_transcrip
 from .transport import Herdr
 
 log = logging.getLogger("herdr-acp")
+KNOWN = ("claude", "codex")  # agents with a transcript reader; anything else gets the screen diff
 POLL = 0.5
 GRACE = 10.0  # end an agent turn without ever seeing "working" only after this long idle
 
@@ -72,26 +73,28 @@ class PaneAgent:
         """Key the reader on the agent process: a (re)started agent gets a fresh reader."""
         pid, name = await self.transport.process()
         # Herdr may not detect an agent it can't see (e.g. codex inside tmux); the process name will.
-        kind = self.agent if self.agent in ("claude", "codex") else {"claude": "claude", "codex": "codex"}.get(name or "")
+        kind = next((k for k in (self.agent, name) if k in KNOWN), None)
         if self.reader and pid == self.pid and (kind or isinstance(self.reader, ScreenDiff)):
             return
-        self.pid = pid
         if kind == "claude" and pid:
-            self.reader = ClaudeTranscript(claude_transcript_for(pid))
-            log.info("tailing claude transcript %s", self.reader.path)
+            reader = ClaudeTranscript(claude_transcript_for(pid))
+            log.info("tailing claude transcript %s", reader.path)
         elif kind == "codex" and pid:
-            self.reader = CodexRollout(pid)
-            log.info("tailing codex rollout %s", self.reader.path)
-        elif not isinstance(self.reader, ScreenDiff):
-            self.reader = ScreenDiff(self.transport.read_screen)
+            reader = CodexRollout(pid)
+            log.info("tailing codex rollout %s", reader.path)
+        elif isinstance(self.reader, ScreenDiff):
+            reader = self.reader
+        else:
+            reader = ScreenDiff(self.transport.read_screen)
             log.info("tailing screen (agent=%s)", self.agent)
+        self.reader, self.pid = reader, pid  # together, and only once the build succeeded (else retried next tick)
 
     async def _tail(self) -> None:
         """Follow whatever is in the pane right now; swap readers if the agent (re)starts."""
         tick = 0
         while True:
             try:
-                self.agent, self.status, _, _ = await self.transport.state()
+                self.agent, self.status = await self.transport.state()
                 if tick % 10 == 0 or self.reader is None:  # ponytail: process-info every 5s
                     await self._pick_reader()
                 tick += 1
@@ -104,9 +107,16 @@ class PaneAgent:
                 log.warning("tail: %s", e)
             await asyncio.sleep(POLL)
 
+    def _agent_settled(self, now: float, start: float, seen_working: bool, idle_since: float, fresh: bool) -> bool:
+        """Idle for `debounce`s with no new updates, once "working" was seen (or GRACE elapsed)."""
+        return (seen_working or now - start >= GRACE) and not fresh and now - idle_since >= self.debounce
+
+    def _shell_quiet(self, now: float, start: float) -> bool:
+        """`quiet`s since the prompt and since the last new output."""
+        return now - start >= self.quiet and now - self.last_update_at >= self.quiet
+
     async def _wait_turn_end(self, start: float) -> str:
-        """Agent turns end `debounce`s after idle once "working" was seen (or GRACE elapsed) and no
-        new updates arrived; shell turns end after `quiet`s with no new output."""
+        """Agent turns end by `_agent_settled`, shell turns by `_shell_quiet`, either by cancel."""
         seen_working, idle_since, seen = False, None, self.last_update_at
         while True:
             await asyncio.sleep(POLL)
@@ -114,16 +124,15 @@ class PaneAgent:
             if self.cancelled:
                 return "cancelled"
             fresh, seen = self.last_update_at > seen, self.last_update_at
-            if self.agent:
-                if self.status == "working":
-                    seen_working, idle_since = True, None
-                    continue
-                idle_since = idle_since or now
-                settled = seen_working or now - start >= GRACE
-                if settled and not fresh and now - idle_since >= self.debounce:
+            if not self.agent:
+                if self._shell_quiet(now, start):
                     break
-            elif now - start >= self.quiet and now - self.last_update_at >= self.quiet:
-                break
+            elif self.status == "working":
+                seen_working, idle_since = True, None
+            else:
+                idle_since = idle_since or now
+                if self._agent_settled(now, start, seen_working, idle_since, fresh):
+                    break
         log.info("turn done (%s)", "agent idle" if self.agent else "screen quiet")
         return "end_turn"
 
@@ -185,14 +194,14 @@ def _selfcheck() -> None:
     async def go():
         global POLL, GRACE
         POLL, GRACE = 0.01, 10.0  # (a) GRACE out of reach: only working->idle may end the turn
-        stop, dt, a = await run(Fake([("fake", "working", None, "/w")] * 10 + [("fake", "idle", None, "/w")]), debounce=0.1)
+        stop, dt, a = await run(Fake([("fake", "working")] * 10 + [("fake", "idle")]), debounce=0.1)
         assert stop == "end_turn" and dt >= 0.1, (stop, dt)
         assert a.agent == "fake" and a.status == "idle" and a.last_update_at == 0.0, (a.agent, a.status)
         GRACE = 0.05  # (b) never saw "working": ends after GRACE
-        stop, dt, _ = await run(Fake([("fake", "idle", None, "/w")]))
+        stop, dt, _ = await run(Fake([("fake", "idle")]))
         assert stop == "end_turn" and dt >= 0.05, (stop, dt)
         # (c) shell: ends after `quiet` of unchanged screen; new lines were streamed
-        stop, dt, a = await run(Fake([(None, "unknown", None, "/w")], ["$ \n", "$ pwd\n/tmp\n$ \n"]), quiet=0.1)
+        stop, dt, a = await run(Fake([(None, "unknown")], ["$ \n", "$ pwd\n/tmp\n$ \n"]), quiet=0.1)
         assert stop == "end_turn" and dt >= 0.1, (stop, dt)
         assert [u.content.text for u in a.conn.ups if u.session_update == "agent_message_chunk"] == ["$ pwd\n/tmp\n"], a.conn.ups
         assert isinstance(a.reader, ScreenDiff) and a.last_update_at > 0
@@ -202,7 +211,7 @@ def _selfcheck() -> None:
         await asyncio.wait([old])
         assert old.cancelled() and a.tail is not old and not a.tail.done()
         # (d) cancel mid-turn
-        f = Fake([("fake", "working", None, "/w")])
+        f = Fake([("fake", "working")])
         stop, _, _ = await run(f, mid=lambda ag, sid: ag.cancel(sid))
         assert stop == "cancelled" and f.keys == ["esc"], (stop, f.keys)
         print("main ok")
