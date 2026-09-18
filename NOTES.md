@@ -3,6 +3,10 @@
 Design decisions and their reasons, dated. Buzz-specific notes live in the herdr-buzz repo.
 
 ## Decisions
+- **Pi and OMP share one reader** (2026-09-18). Pi's session format: `message` records with roles
+  user / assistant / toolResult, `toolCall` blocks in assistant content. The agent holds the file open
+  after its first message, so `/proc/<pid>/fd` names it; before that, the newest session under the
+  agent dir (`$PI_CODING_AGENT_DIR` or `~/.<kind>/agent`) whose header cwd matches the process.
 - **Transcript discovery reads the agent process, nothing else** (2026-09-13: no hooks, no
   extra setup, only when a client attaches). `herdr pane process-info` gives the foreground PID.
   Claude: `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` (Claude writes it itself) holds sessionId + cwd;
@@ -43,6 +47,5 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
 - Cancel (`session/cancel` → Escape) is only covered by the self-check, not a live agent.
 - Interleaved turns (a human typing mid-turn) are by design absorbed into the turn.
 - `--reply-from-output` for blank shells: not written.
-- Pi reader: not written (screen diff is the floor for it today).
 - Claude's folder-trust dialog on a fresh cwd blocks `herdr agent start` (`agent_not_ready`); answer it
   by hand (Down, Enter) once per new directory.

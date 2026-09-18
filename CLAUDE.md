@@ -16,7 +16,7 @@ call and record it in `NOTES.md` (decisions and their reasons, dated).
 - Client-agnostic. The only client hook is `--footer` / `HERDR_ACP_FOOTER`.
 - No turn isolation: a turn owns everything from its prompt until the pane goes idle; a human
   typing in the pane mid-turn is part of the turn.
-- Must work for Claude Code, Codex, Pi, and a blank shell. Pi is not done.
+- Must work for Claude Code, Codex, Pi/OMP, and a blank shell.
 - No systemd, no supervisor, no auto-restart.
 - Ponytail rules: stdlib first, fewest files, no speculative abstractions, one runnable
   self-check per non-trivial piece of logic (`python -m herdr_acp.<module>`).
@@ -25,8 +25,8 @@ call and record it in `NOTES.md` (decisions and their reasons, dated).
 - `transport.py` — the `herdr` CLI: state, process (sees through a tmux client), send text/keys,
   read screen.
 - `reader.py` — what happened in the pane, as ACP updates. Transcript discovery reads the agent
-  *process* (PID from Herdr): Claude's `<cfg>/sessions/<pid>.json` names the transcript; Codex holds
-  its rollout open in `/proc/<pid>/fd`. Screen diff is the floor for a bare shell.
+  *process* (PID from Herdr): Claude's `<cfg>/sessions/<pid>.json` names the transcript; Codex and
+  Pi/OMP hold their session file open in `/proc/<pid>/fd`. Screen diff is the floor for a bare shell.
 - `main.py` — the ACP server: `initialize`, `session/new` (starts the tail), `session/prompt`
   (type, wait for idle + debounce), `session/cancel` (Escape). Reader is keyed on the agent PID
   and re-picked every 5s so a restarted agent is followed.

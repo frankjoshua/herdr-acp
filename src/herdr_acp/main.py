@@ -22,11 +22,11 @@ from acp import (
 )
 from acp.schema import Implementation
 
-from .reader import ClaudeTranscript, CodexRollout, ScreenDiff, claude_transcript_for
+from .reader import ClaudeTranscript, CodexRollout, PiSession, ScreenDiff, claude_transcript_for
 from .transport import Herdr
 
 log = logging.getLogger("herdr-acp")
-KNOWN = ("claude", "codex")  # agents with a transcript reader; anything else gets the screen diff
+KNOWN = ("claude", "codex", "omp", "pi")  # agents with a transcript reader; anything else gets the screen diff
 POLL = 0.5
 GRACE = 10.0  # end an agent turn without ever seeing "working" only after this long idle
 
@@ -82,6 +82,9 @@ class PaneAgent:
         elif kind == "codex" and pid:
             reader = CodexRollout(pid)
             log.info("tailing codex rollout %s", reader.path)
+        elif kind in ("omp", "pi") and pid:
+            reader = PiSession(pid, kind)
+            log.info("tailing %s session %s", kind, reader.path)
         elif isinstance(self.reader, ScreenDiff):
             reader = self.reader
         else:

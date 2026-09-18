@@ -21,9 +21,9 @@ python3 -m venv .venv && .venv/bin/pip install -e .      # needs the `herdr` CLI
 
 ## Layers (`src/herdr_acp/`)
 - **transport.py** — send text, read screen, pane state and process, via the `herdr` CLI.
-- **reader.py** — what happened in the pane. The transcript is found from the agent's own process
-  (Claude's per-PID session file, Codex's open rollout), so no hooks or config are needed in the
-  agent. Screen diff is the floor for a bare shell.
+- **reader.py** — what happened in the pane. Claude, Codex, and Pi/OMP transcripts are found from
+  the agent's own process (Claude's per-PID session file, the open session file for Codex and Pi),
+  so no hooks or config are needed in the agent. Screen diff is the floor for a bare shell.
 - **main.py** — the ACP server. Turn = prompt → stream → idle → `end_turn`; the tail runs for the
   whole session, not just during turns.
 

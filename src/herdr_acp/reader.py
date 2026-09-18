@@ -2,9 +2,10 @@
 
 ClaudeTranscript tails <cfg>/projects/<cwd>/<session>.jsonl from a byte offset.
 CodexRollout tails <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl the same way.
+PiSession tails a Pi-format session (Pi, OMP): <agent dir>/sessions/<cwd>/<ts>_<id>.jsonl.
 ScreenDiff diffs successive plain-text screen snapshots (floor for shells / unknown agents).
-All expose `async poll() -> list[update]`. `claude_transcript_for(pid)` / `codex_rollout_for(pid)`
-find the file from the agent process itself (`proc_info`).
+All expose `async poll() -> list[update]`. `claude_transcript_for(pid)` / `codex_rollout_for(pid)` /
+`pi_session_for(pid, kind)` find the file from the agent process itself (`proc_info`).
 """
 
 import difflib
@@ -13,6 +14,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from acp import (
     start_tool_call,
@@ -64,8 +66,8 @@ def claude_transcript_for(pid: int) -> str:
 
 
 def _tool_title(name: str, inp: dict) -> str:
-    arg = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("url") \
-        or inp.get("description") or inp.get("prompt") or ""
+    arg = inp.get("command") or inp.get("file_path") or inp.get("path") or inp.get("pattern") or inp.get("url") \
+        or inp.get("title") or inp.get("description") or inp.get("prompt") or ""
     arg = str(arg).splitlines()[0] if arg else ""
     return f"{name}: {arg[:120]}" if arg else name
 
@@ -228,13 +230,99 @@ class CodexRollout:
         self.checked = 0.0
 
     async def poll(self) -> list:
-        import time
         if not self.path and time.monotonic() - self.checked >= 2:
             self.checked = time.monotonic()
             self.path, self.offset = codex_rollout_for(self.pid), 0
         if not self.path:
             return []
         out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, codex_updates)
+        return out
+
+
+# ---- Pi / OMP: <agent dir>/sessions/<cwd mangled>/<timestamp>_<session id>.jsonl -------------
+# Pi's session format (pi.dev/docs/latest/session-format), which OMP shares. The agent holds the
+# file open once the first message exists, so /proc/<pid>/fd names it; before that, the newest
+# session under the agent dir whose `session` header cwd is the process cwd and which is younger
+# than the process. Agent dir: $PI_CODING_AGENT_DIR, else ~/.<kind>/agent; sessions dir may be
+# overridden by $PI_CODING_AGENT_SESSION_DIR.
+
+PI_TOOL_KIND = {"bash": "execute", "eval": "execute", "read": "read", "write": "edit", "edit": "edit",
+                "grep": "search", "glob": "search", "find": "search", "fetch": "fetch", "web": "fetch"}
+
+
+def pi_session(cwd: str, sessions_dir: str, newer_than: float = 0.0) -> str | None:
+    best = None
+    for f in glob.glob(f"{sessions_dir}/*/*.jsonl"):
+        m = os.path.getmtime(f)
+        if m <= newer_than or (best and m <= best[0]):
+            continue
+        try:
+            with open(f) as fh:
+                for _ in range(3):  # `session` header is within the first lines
+                    head = json.loads(fh.readline() or "{}")
+                    if head.get("type") == "session":
+                        break
+        except (OSError, ValueError) as e:
+            log.debug("pi session %s skipped: %r", f, e)
+            continue
+        if head.get("type") == "session" and head.get("cwd") == cwd:
+            best = (m, f)
+    return best[1] if best else None
+
+
+def pi_session_for(pid: int, kind: str) -> str | None:
+    p = proc_info(pid)
+    for f in p["fds"]:
+        if "/sessions/" in f and f.endswith(".jsonl"):
+            return f
+    agent_dir = p["env"].get("PI_CODING_AGENT_DIR") or os.path.expanduser(f"~/.{kind}/agent")
+    sessions = p["env"].get("PI_CODING_AGENT_SESSION_DIR") or os.path.join(agent_dir, "sessions")
+    return pi_session(p["cwd"], sessions, p["started"])
+
+
+def pi_updates(entry: dict) -> list:
+    """Map one Pi-format session line to ACP updates."""
+    if entry.get("type") != "message":
+        return []
+    m = entry.get("message") or {}
+    role, content = m.get("role"), m.get("content")
+    if role == "user":
+        text = content if isinstance(content, str) else "".join(b.get("text", "") for b in content or [] if b.get("type") == "text")
+        return [update_user_message_text(text.strip())] if text.strip() else []
+    if role == "toolResult":
+        text = content if isinstance(content, str) else _result_text(content)
+        return [update_tool_call(m.get("toolCallId", ""), status="failed" if m.get("isError") else "completed",
+                                 content=[tool_content(text_block(text[:4000]))] if text else None)]
+    if role != "assistant" or not isinstance(content, list):
+        return []
+    out = []
+    for b in content:
+        t = b.get("type")
+        if t == "text" and b.get("text"):
+            out.append(update_agent_message_text(b["text"]))
+        elif t == "thinking" and b.get("thinking"):
+            out.append(update_agent_thought_text(b["thinking"]))
+        elif t == "toolCall":
+            name, args = b.get("name", "tool"), b.get("arguments") or {}
+            out.append(start_tool_call(b.get("id", ""), _tool_title(name, args), kind=PI_TOOL_KIND.get(name, "other"),
+                                       status="in_progress", raw_input=args))
+    return out
+
+
+class PiSession:
+    def __init__(self, pid: int, kind: str = "omp", path: str | None = None):
+        self.pid, self.kind = pid, kind
+        self.path = path or pi_session_for(pid, kind)  # None until the first message creates it
+        self.offset = os.path.getsize(self.path) if self.path else 0
+        self.checked = 0.0
+
+    async def poll(self) -> list:
+        if not self.path and time.monotonic() - self.checked >= 2:
+            self.checked = time.monotonic()
+            self.path, self.offset = pi_session_for(self.pid, self.kind), 0
+        if not self.path:
+            return []
+        out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, pi_updates)
         return out
 
 
@@ -353,6 +441,38 @@ def _selfcheck() -> None:
     assert [u.session_update for u in ups] == ["user_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
                                               "tool_call", "tool_call_update", "agent_message_chunk"], [u.session_update for u in ups]
     assert ups[2].title == "exec: pwd" and ups[3].content[0].content.text == "/work\n" and ups[4].title == "edit: a.py"
+    # Pi/OMP: session found by cwd under the agent dir, message roles → updates
+    home = tempfile.mkdtemp()
+    d = os.path.join(home, "sessions", "-work"); os.makedirs(d)
+    def pi_file(name, cwd, rows):
+        with open(os.path.join(d, name), "w") as f:
+            f.write(json.dumps({"type": "title", "title": "t"}) + "\n")
+            f.write(json.dumps({"type": "session", "id": "s", "cwd": cwd}) + "\n")
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+    pi_file("2026-01-01T00-00-00-000Z_a.jsonl", "/other", [])
+    pi_file("2026-01-01T00-00-01-000Z_b.jsonl", "/work", [])
+    os.utime(os.path.join(d, "2026-01-01T00-00-00-000Z_a.jsonl"), (1, 1))
+    sess = os.path.join(d, "2026-01-01T00-00-01-000Z_b.jsonl")
+    assert pi_session("/work", os.path.join(home, "sessions")) == sess
+    assert pi_session("/work", os.path.join(home, "sessions"), newer_than=2e10) is None
+    r = PiSession(0, "omp", path=sess)
+    assert asyncio.run(r.poll()) == []
+    with open(sess, "a") as f:
+        for row in [
+            {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "run pwd"}]}},
+            {"type": "message", "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "ok"}, {"type": "text", "text": "Sure."},
+                {"type": "toolCall", "id": "t1", "name": "bash", "arguments": {"command": "pwd"}}]}},
+            {"type": "custom", "customType": "tool_execution_start", "data": {"toolCallId": "t1"}},
+            {"type": "message", "message": {"role": "toolResult", "toolCallId": "t1", "toolName": "bash",
+                                            "content": [{"type": "text", "text": "/work\n"}]}},
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}},
+        ]:
+            f.write(json.dumps(row) + "\n")
+    ups = asyncio.run(r.poll())
+    assert [u.session_update for u in ups] == ["user_message_chunk", "agent_thought_chunk", "agent_message_chunk",
+                                              "tool_call", "tool_call_update", "agent_message_chunk"], [u.session_update for u in ups]
+    assert ups[3].title == "bash: pwd" and ups[3].kind == "execute" and ups[4].content[0].content.text == "/work\n"
     print("reader ok")
 
 
