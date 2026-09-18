@@ -11,10 +11,21 @@ ACP client  --stdio/ACP-->  herdr-acp  --herdr CLI-->  pane (claude / codex / pi
                                ^-- transcript or screen diff --'
 ```
 
-Layers (`src/herdr_acp/`):
-- **transport.py** — send text, read screen, session id, status. Herdr via the `herdr` CLI.
-- **reader.py** — what happened in the pane. Claude transcript, Codex rollout; screen diff is the floor.
-- **main.py** — the ACP server. Turn = prompt → reader stream → idle → `end_turn`.
+## Install
+
+```
+git clone https://github.com/frankjoshua/herdr-acp && cd herdr-acp
+python3 -m venv .venv && .venv/bin/pip install -e .      # needs the `herdr` CLI on PATH
+.venv/bin/herdr-acp --pane <pane-id>                     # speaks ACP on stdin/stdout
+```
+
+## Layers (`src/herdr_acp/`)
+- **transport.py** — send text, read screen, pane state and process, via the `herdr` CLI.
+- **reader.py** — what happened in the pane. The transcript is found from the agent's own process
+  (Claude's per-PID session file, Codex's open rollout), so no hooks or config are needed in the
+  agent. Screen diff is the floor for a bare shell.
+- **main.py** — the ACP server. Turn = prompt → stream → idle → `end_turn`; the tail runs for the
+  whole session, not just during turns.
 
 Flags: `--quiet` (shell turn ends after N quiet seconds), `--debounce` (agent turn ends N seconds
 after idle), `--footer` / `HERDR_ACP_FOOTER` (text appended to every prompt).
@@ -22,4 +33,5 @@ after idle), `--footer` / `HERDR_ACP_FOOTER` (text appended to every prompt).
 Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.transport <pane>`,
 `python tests/roundtrip.py <pane> "pwd"`.
 
-Clients: Buzz glue (identity minting, buzz-acp launcher) lives in `../herdr-buzz`.
+Clients: the Buzz bridge (identity minting, buzz-acp launcher, Herdr plugin) is
+[herdr-buzz](https://github.com/frankjoshua/herdr-buzz).
