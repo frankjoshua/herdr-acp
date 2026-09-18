@@ -5,14 +5,14 @@ herdr-acp exposes a [Herdr](https://herdr.dev) pane as an
 `herdr-acp --pane <id>`; prompts are typed into the pane, and everything the pane does streams
 back as `session/update`. The pane and the client are one shared session.
 
-Owner: Joshua Frank. Ask him only for decisions that are genuinely his; otherwise make the
-routine call and record it in `NOTES.md` (decisions, verified vs. assumed, dated).
+Ask the maintainer only for decisions that are genuinely theirs; otherwise make the routine
+call and record it in `NOTES.md` (decisions and their reasons, dated).
 
 ## Constraints (do not re-litigate)
 - Herdr owns the agent. herdr-acp never launches, resumes, or replaces what runs in a pane.
 - The agent in the pane stays oblivious: no hooks, no env, no instructions, no tokens spent on the
   bridge. Anything client-specific (Buzz identity, posting, prompt shaping) lives in the client
-  glue, not here. Buzz glue: `../herdr-buzz` (separate repo).
+  glue, not here. Buzz glue: https://github.com/frankjoshua/herdr-buzz.
 - Client-agnostic. The only client hook is `--footer` / `HERDR_ACP_FOOTER`.
 - No turn isolation: a turn owns everything from its prompt until the pane goes idle; a human
   typing in the pane mid-turn is part of the turn.
@@ -33,5 +33,5 @@ routine call and record it in `NOTES.md` (decisions, verified vs. assumed, dated
 
 Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.main --selfcheck`,
 `python -m herdr_acp.transport <pane>`; live: `python tests/roundtrip.py <pane> "<prompt>"`.
-Test in your own Herdr Space and pane (`herdr workspace create`, `herdr agent start`), never in
-Joshua's. Commit small, on `main`.
+Test in a Herdr Space and pane of your own (`herdr workspace create`, `herdr agent start`), never
+in someone's working pane. Commit small, on `main`.

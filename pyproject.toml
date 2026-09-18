@@ -3,7 +3,7 @@ name = "herdr-acp"
 version = "0.1.0"
 description = "Expose a Herdr pane as an ACP agent so bridges like buzz-acp can talk to whatever is running in it."
 requires-python = ">=3.12"
-license = "MIT"
+license = "Apache-2.0"
 readme = "README.md"
 dependencies = ["agent-client-protocol"]
 
