@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 
 from acp import (
     start_tool_call,
@@ -126,6 +127,24 @@ def _new_lines(path: str, offset: int) -> list[bytes]:
     return data.splitlines(keepends=True)
 
 
+def _offset_since(path: str, since: float) -> int:
+    """Where the lines stamped at or after `since` start (the end when none are). A session found
+    only after its process started may be a resumed one: what it holds from before is history."""
+    offset = 0
+    with open(path, "rb") as f:
+        for line in f:
+            if not line.endswith(b"\n"):
+                break
+            try:
+                ts = json.loads(line).get("timestamp")
+                if isinstance(ts, str) and datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() >= since:
+                    return offset
+            except (ValueError, AttributeError):
+                pass
+            offset += len(line)
+    return offset
+
+
 def _parse_lines(path: str, lines: list[bytes], offset: int, to_updates) -> tuple[list, int]:
     out = []
     for line in lines:
@@ -228,11 +247,13 @@ class CodexRollout:
         self.path = path or codex_rollout_for(pid)  # None until Codex opens its rollout
         self.offset = os.path.getsize(self.path) if self.path else 0
         self.checked = 0.0
+        self.started = proc_info(pid)["started"] if not self.path else 0.0
 
     async def poll(self) -> list:
         if not self.path and time.monotonic() - self.checked >= 2:
             self.checked = time.monotonic()
-            self.path, self.offset = codex_rollout_for(self.pid), 0
+            self.path = codex_rollout_for(self.pid)
+            self.offset = _offset_since(self.path, self.started) if self.path else 0
         if not self.path:
             return []
         out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, codex_updates)
@@ -315,11 +336,13 @@ class PiSession:
         self.path = path or pi_session_for(pid, kind)  # None until the first message creates it
         self.offset = os.path.getsize(self.path) if self.path else 0
         self.checked = 0.0
+        self.started = proc_info(pid)["started"] if not self.path else 0.0
 
     async def poll(self) -> list:
         if not self.path and time.monotonic() - self.checked >= 2:
             self.checked = time.monotonic()
-            self.path, self.offset = pi_session_for(self.pid, self.kind), 0
+            self.path = pi_session_for(self.pid, self.kind)
+            self.offset = _offset_since(self.path, self.started) if self.path else 0
         if not self.path:
             return []
         out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, pi_updates)

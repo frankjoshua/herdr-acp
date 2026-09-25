@@ -15,6 +15,16 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
   (from the process env) whose session_meta.cwd is the process cwd and which is younger than the
   process. The tail re-checks the PID every 5s, so a restarted agent gets a fresh reader. All the
   glob/mtime/session-id heuristics are gone.
+- **A session file found after the reader started is read from the process start, not byte 0**
+  (2026-09-25, CIO-62). `omp --resume` opens its old session file only on the first write, so the
+  reader built earlier found it later and replayed 1.7k historical messages (the relay answered 429).
+  Codex and Pi/OMP now skip to the first line stamped at or after the process start (`_offset_since`);
+  with none yet, they skip to the end. Every Pi/OMP and Codex line carries an ISO `timestamp`
+  (the OMP `title` line has none, which counts as history). "Process start" is `/proc/<pid>` mtime,
+  which is really that inode's first lookup, so it can be late but never early: at worst a line
+  is dropped, never replayed. OMP `custom_message` entries (IRC, async results) can be stamped up
+  to ~75s before they are written, but they produce no updates. Claude is not covered: its
+  transcript path comes from `sessions/<pid>.json` and is tailed from its size when it exists.
 - **The pane is a shared session** (2026-09-13). From
   `session/new` on, herdr-acp tails the pane continuously and streams everything as
   `session/update`: a human typing in the pane → `user_message_chunk`, agent text, thoughts, tool
