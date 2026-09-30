@@ -13,11 +13,14 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
   references the open tool call when the transcript already streamed one; otherwise it becomes a
   `dialog-…` tool call titled with the question and carrying the dialog text. If the dialog
   changes before the client answers (someone answered at the pane), the request is dropped
-  without `$/cancel_request`, which the SDK doesn't send. If `request_permission` fails once,
-  dialogs are left to the pane for the rest of the process. Dialogs outside a turn are not
-  asked, because a human typed that prompt at the pane. Verified live against Codex (allow and
-  reject) and OMP `--approval-mode always-ask`. Claude is verified only against a fixture shaped
-  like its Select list (`/model`), because the test Claude wasn't logged in.
+  without `$/cancel_request`, which the SDK doesn't send. A `cancelled` outcome sends Esc and
+  ends the turn `cancelled`. The `session/cancel` that follows sends no second Esc, because
+  Esc-Esc opens Claude's rewind menu. If `request_permission` fails once, dialogs are left to the
+  pane for the rest of the process. Dialogs outside a turn are not asked, because a human typed
+  that prompt at the pane. The dialog is read from `--source visible`: Claude draws on the
+  alternate screen, and the default `recent` source returns nothing for it. Verified live
+  (2026-09-30) against Claude 2.1.285 (allow, reject, client-cancelled), Codex (allow and reject)
+  and OMP `--approval-mode always-ask`.
 - **Pi and OMP share one reader** (2026-09-18). Pi's session format: `message` records with roles
   user / assistant / toolResult, `toolCall` blocks in assistant content. The agent holds the file open
   after its first message, so `/proc/<pid>/fd` names it; before that, the newest session under the
@@ -61,7 +64,6 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
 
 ## Not yet done
 - Cancel (`session/cancel` → Escape) is only covered by the self-check, not a live agent.
-- Claude's permission dialog is not yet exercised live (see "Pane dialogs").
 - OMP's reader can pick an advisor side-file (`__advisor.scribe.jsonl`) that the agent holds
   open, instead of the main session file (seen 2026-09-29).
 - Interleaved turns (a human typing mid-turn) are by design absorbed into the turn.

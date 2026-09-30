@@ -584,11 +584,15 @@ def _selfcheck() -> None:
            "│                            │\n│ ↑/↓ navigate  \U000f0311 select  \uf12b7 cancel │\n"
            "╰────────────────────────────╯\n personal\nthink:high\n")
     assert parse_dialog(omp) == ("Allow tool: bash", ["Approve", "Deny"], 0, "Allow tool: bash\nCommand: touch /tmp/x")
-    claude = ("● Bash(touch /tmp/x)\n────────────────────\n Bash command\n\n   touch /tmp/x\n   Create marker\n\n"
-              " Do you want to proceed?\n   1. Yes\n ❯ 2. Yes, and don't ask again for touch\n      commands in /tmp\n"
-              "   3. No, and tell Claude what to do\n      differently (esc)\n\n Esc to cancel · Tab to amend\n")
+    claude = ("● Creating the marker file\n  ⎿  $ touch /tmp/x\n────────────────────\n Bash command\n\n"  # Claude 2.1.285
+              " Tip: auto mode handles these prompts for you — choose \"switch to auto mode\" below\n\n"
+              "   touch /tmp/x\n   Create the marker file\n\n Do you want to proceed?\n ❯ 1. Yes\n"
+              "   2. Yes, and always allow access to /tmp from this project\n"
+              "   3. Yes, and switch to auto mode · auto mode handles these prompts for you\n   4. No\n\n"
+              " Esc to cancel · Tab to amend\n")
     q, labels, cur, _ = parse_dialog(claude)
-    assert q == "Do you want to proceed?" and cur == 1 and labels[2] == "No, and tell Claude what to do differently", labels
+    assert q == "Do you want to proceed?" and cur == 0 and len(labels) == 4, (q, labels)
+    assert [option_kind(lb) for lb in labels] == ["allow_once", "allow_always", "allow_once", "reject_once"]
     idle = "● Done. Options:\n  1. keep it\n  2. drop it\n────\n❯ Try \"refactor\"\n  ↑/↓ to scroll\n────\n"
     assert parse_dialog(idle) is None  # a numbered answer and the input box are not a dialog
     print("reader ok")

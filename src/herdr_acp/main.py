@@ -27,7 +27,6 @@ from acp import (
 from acp.schema import Implementation, PermissionOption, ToolCallUpdate
 
 from .reader import (
-    DIALOG_ROWS,
     ClaudeTranscript,
     CodexRollout,
     PiSession,
@@ -79,6 +78,8 @@ class PaneAgent:
         return NewSessionResponse(session_id=self.session_id)
 
     async def cancel(self, session_id: str, **kw):
+        if self.cancelled:
+            return  # already cancelled (e.g. via a cancelled permission request): a second Esc opens Claude's rewind
         self.cancelled = True
         try:
             await self.transport.send_keys("esc")
@@ -142,7 +143,7 @@ class PaneAgent:
     async def _dialog(self):
         """The choice dialog waiting in the pane, or None (also when the pane can't be read)."""
         try:
-            return parse_dialog(await self.transport.read_screen(DIALOG_ROWS))
+            return parse_dialog(await self.transport.read_visible())
         except Exception as e:  # herdr hiccup: no dialog this poll
             log.warning("dialog: %s", e)
             return None
@@ -176,8 +177,9 @@ class PaneAgent:
             log.warning("request_permission failed, leaving dialogs to the pane: %s", e)
             self.can_ask = False
             return False
-        if outcome.outcome != "selected":
-            return True  # the client cancelled the turn; session/cancel follows
+        if outcome.outcome != "selected":  # the client cancelled the turn: close the dialog and end it
+            await self.cancel(self.session_id)
+            return True
         now = await self._dialog()
         if not now or now[:2] != shown:
             return True  # answered at the pane meanwhile
@@ -246,7 +248,7 @@ def main() -> None:
 def _selfcheck() -> None:
     """Turn-end rule and dialog answering against a scripted transport; no pane needed."""
     from acp import text_block
-    from acp.schema import AllowedOutcome, RequestPermissionResponse
+    from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse
 
     class Fake:  # state()/read_screen() play their scripts, then repeat the last entry
         def __init__(self, states, screens=("",)):
@@ -257,14 +259,16 @@ def _selfcheck() -> None:
         async def send_text(self, text): self.sent.append(text)
         async def send_keys(self, *keys): self.keys += keys
         async def read_screen(self, lines=200): return self.screens.pop(0) if len(self.screens) > 1 else self.screens[0]
+        async def read_visible(self): return ""
 
-    class Dialog(Fake):  # blocked on a dialog until select() answers it or a mid-turn "human" closes it
+    class Dialog(Fake):  # blocked on a dialog until select()/Esc closes it or a mid-turn "human" answers it
         def __init__(self):
             super().__init__([("fake", "working")])
             self.dialog, self.steps = " Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again\n   3. No (esc)\n", []
         async def state(self): return ("fake", "blocked") if self.dialog else ("fake", "idle")
-        async def read_screen(self, lines=200): return self.dialog or ""
+        async def read_visible(self): return self.dialog or ""
         async def select(self, steps): self.steps.append(steps); self.dialog = None
+        async def send_keys(self, *keys): self.keys += keys; self.dialog = None
 
     class Conn:
         def __init__(self, answer=None): self.ups, self.asked, self.answer = [], [], answer
@@ -294,6 +298,9 @@ def _selfcheck() -> None:
 
     async def fail():
         raise RuntimeError("method not found")
+
+    async def dismissed():
+        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 
     async def close_at_pane(agent, sid):
         agent.transport.dialog = None
@@ -334,6 +341,11 @@ def _selfcheck() -> None:
         # (g) a client that can't answer: asked once, then the dialog is left to the pane
         stop, _, a = await run(f := Dialog(), answer=fail, mid=close_at_pane)
         assert stop == "end_turn" and len(a.conn.asked) == 1 and not a.can_ask, (stop, a.conn.asked)
+        # (h) the client cancels the request: one Esc closes the dialog and the turn ends cancelled;
+        # the session/cancel that follows sends no second Esc
+        stop, _, a = await run(f := Dialog(), answer=dismissed)
+        await a.cancel(a.session_id)
+        assert stop == "cancelled" and f.keys == ["esc"] and len(a.conn.asked) == 1, (stop, f.keys, a.conn.asked)
         print("main ok")
 
     asyncio.run(go())

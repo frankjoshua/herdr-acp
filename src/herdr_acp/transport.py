@@ -98,6 +98,11 @@ class Herdr:
     async def read_screen(self, lines: int = 200) -> str:
         return await _run("pane", "read", self.pane, "--lines", str(lines), "--format", "text")
 
+    async def read_visible(self) -> str:
+        """The rendered viewport. Full-screen TUIs (Claude) draw on the alternate screen, which
+        the default `recent` source doesn't show."""
+        return await _run("pane", "read", self.pane, "--source", "visible", "--format", "text")
+
 
 async def _selfcheck(pane: str) -> None:
     h = Herdr(pane)
