@@ -27,8 +27,10 @@ call and record it in `NOTES.md` (decisions and their reasons, dated).
 - `reader.py` — what happened in the pane, as ACP updates. Transcript discovery reads the agent
   *process* (PID from Herdr): Claude's `<cfg>/sessions/<pid>.json` names the transcript; Codex and
   Pi/OMP hold their session file open in `/proc/<pid>/fd`. Screen diff is the floor for a bare shell.
+  `parse_dialog` reads an approval/question dialog off the screen.
 - `main.py` — the ACP server: `initialize`, `session/new` (starts the tail), `session/prompt`
-  (type, wait for idle + debounce), `session/cancel` (Escape). Reader is keyed on the agent PID
+  (type, wait for idle + debounce; a dialog becomes `session/request_permission` and the choice is
+  typed back), `session/cancel` (Escape). Reader is keyed on the agent PID
   and re-picked every 5s so a restarted agent is followed.
 
 Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.main --selfcheck`,

@@ -4,6 +4,7 @@ ClaudeTranscript tails <cfg>/projects/<cwd>/<session>.jsonl from a byte offset.
 CodexRollout tails <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl the same way.
 PiSession tails a Pi-format session (Pi, OMP): <agent dir>/sessions/<cwd>/<ts>_<id>.jsonl.
 ScreenDiff diffs successive plain-text screen snapshots (floor for shells / unknown agents).
+`parse_dialog(screen)` finds an approval/question dialog waiting at the bottom of the pane.
 All expose `async poll() -> list[update]`. `claude_transcript_for(pid)` / `codex_rollout_for(pid)` /
 `pi_session_for(pid, kind)` find the file from the agent process itself (`proc_info`).
 """
@@ -352,6 +353,100 @@ class ScreenDiff:
         return [update_agent_message_text("\n".join(new) + "\n")] if new else []
 
 
+CURSOR = "❯›>▶►→➜\uf054"  # the selected-row marker of TUI lists (\uf054: OMP's nerd-font chevron)
+NUMBERED = re.compile(rf"^(\s*)([{CURSOR}]\s*)?(\d+)\.\s+(\S.*)$")  # Claude, Codex: "❯ 1. Yes"
+SHORTCUT = re.compile(r"\s+\((?:esc|[a-z])\)$")  # Codex: "Yes, proceed (y)"
+FRAME = "─━═▔╭╮╰╯├┤┌┐└┘"
+DIALOG_ROWS = 25  # a dialog waiting for an answer sits at the bottom of the screen
+
+
+def _unbox(line: str) -> str:
+    line = line.rstrip()
+    if line[:1] in "│┃║":
+        line = line[1:]
+    if line[-1:] in "│┃║":
+        line = line[:-1]
+    return line.rstrip()
+
+
+def _numbered(rows: list[str]) -> tuple[int, list[str], int] | None:
+    """The last "1. … 2. …" list with exactly one cursor row: (first row, labels, cursor index)."""
+    found, run = None, None  # run: [first row, labels, cursor indexes, label column]
+    for i, row in enumerate(rows):
+        m = NUMBERED.match(row)
+        if m and int(m[3]) == 1:
+            run = [i, [m[4]], [0] if m[2] else [], m.start(4)]
+        elif m and run and int(m[3]) == len(run[1]) + 1:
+            run[1].append(m[4])
+            run[2] += [len(run[1]) - 1] if m[2] else []
+            run[3] = m.start(4)
+        elif run and row.strip() and len(row) - len(row.lstrip()) >= run[3]:
+            run[1][-1] += " " + row.strip()  # a label wrapped onto the next row
+        else:
+            run = None
+        if run and len(run[1]) >= 2 and len(run[2]) == 1:
+            found = (run[0], list(run[1]), run[2][0])
+    return found
+
+
+def _navigated(rows: list[str]) -> tuple[int, list[str], int] | None:
+    """An unnumbered list right above a "↑/↓ navigate" hint (OMP): one cursor row, the other rows
+    indented to the cursor row's label."""
+    hint = next((i for i in range(len(rows) - 1, -1, -1) if "↑/↓" in rows[i] or "↑↓" in rows[i]), None)
+    if hint is None:
+        return None
+    end = hint
+    while end > 0 and not rows[end - 1].strip():
+        end -= 1
+    start = end
+    while start > 0 and rows[start - 1].strip():
+        start -= 1
+    opts = rows[start:end]
+    cursors = [i for i, o in enumerate(opts) if o.lstrip()[:1] in CURSOR]
+    if len(opts) < 2 or len(cursors) != 1:
+        return None
+    marked = opts[cursors[0]]
+    col = len(marked) - len(marked.lstrip()[1:].lstrip())
+    if any(len(o) - len(o.lstrip()) != col for i, o in enumerate(opts) if i != cursors[0]):
+        return None
+    return start, [o.strip().lstrip(CURSOR).strip() for o in opts], cursors[0]
+
+
+def parse_dialog(screen: str) -> tuple[str, list[str], int, str] | None:
+    """(question, option labels, cursor index, dialog text) of the choice dialog waiting at the
+    bottom of the pane (an approval or a question), or None. The text is what sits above the
+    options, up to a frame or a double blank line."""
+    rows = [_unbox(r) for r in ANSI.sub("", screen).splitlines()][-DIALOG_ROWS:]
+    hit = _numbered(rows) or _navigated(rows)
+    if not hit:
+        return None
+    first, labels, cursor = hit
+    above, blank = [], False
+    for row in reversed(rows[:first]):
+        s = row.strip()
+        if not s:
+            if blank and above:
+                break  # a double blank row: the dialog starts below it
+            blank = True
+            continue
+        blank, bare = False, s.strip(FRAME).strip()
+        if bare:
+            above.append(bare)
+        if not bare or s[0] in "╭┌":
+            break  # a rule, or the top of the dialog's frame ("╭─ Allow tool: bash ─╮", title kept)
+    text = "\n".join(reversed(above))
+    question = next((a for a in reversed(text.splitlines()) if a.endswith("?")), text.split("\n", 1)[0])
+    return question, [SHORTCUT.sub("", lb) for lb in labels], cursor, text
+
+
+def option_kind(label: str) -> str:
+    """ACP PermissionOption kind for a dialog choice, from its wording."""
+    low = label.lower()
+    no = low.startswith(("no", "deny", "reject", "decline", "cancel", "skip", "don't", "do not"))
+    always = any(w in low for w in ("always", "don't ask again", "do not ask again", "until next", "never"))
+    return ("reject" if no else "allow") + ("_always" if always else "_once")
+
+
 def _selfcheck() -> None:
     import asyncio
     import tempfile
@@ -473,6 +568,29 @@ def _selfcheck() -> None:
     assert [u.session_update for u in ups] == ["user_message_chunk", "agent_thought_chunk", "agent_message_chunk",
                                               "tool_call", "tool_call_update", "agent_message_chunk"], [u.session_update for u in ups]
     assert ups[3].title == "bash: pwd" and ups[3].kind == "execute" and ups[4].content[0].content.text == "/work\n"
+    # dialogs, as `herdr pane read` shows them in a 44-column pane
+    codex = ("\n\n  Would you like to run the following com\n\n  Environment: local\n\n  Reason: Allow creating\n"
+             "  /tmp/x with the\n  [… 9 lines] ctrl + a view all\n\n› 1. Yes, proceed (y)\n"
+             "  2. Yes, and don't ask again for\n     commands that start with `touch /\n     tmp/x` (p)\n"
+             "  3. No, and tell Codex what to do\n     differently (esc)\n\n  Press enter to confirm or esc to cancel\n")
+    q, labels, cur, txt = parse_dialog(codex)
+    assert labels == ["Yes, proceed", "Yes, and don't ask again for commands that start with `touch / tmp/x`",
+                      "No, and tell Codex what to do differently"] and cur == 0, labels
+    assert q == "Would you like to run the following com" and txt.endswith("ctrl + a view all"), (q, txt)
+    assert [option_kind(lb) for lb in labels] == ["allow_once", "allow_always", "reject_once"]
+    omp = ("│ $ touch /tmp/x    │\n╰────────────╯\n\n  \uf12b7 Creating marker file\n"
+           "╭─ Allow tool: bash ─────────╮\n│                            │\n│ Command: touch /tmp/x      │\n"
+           "│                            │\n│  \uf054 Approve                 │\n│    Deny                    │\n"
+           "│                            │\n│ ↑/↓ navigate  \U000f0311 select  \uf12b7 cancel │\n"
+           "╰────────────────────────────╯\n personal\nthink:high\n")
+    assert parse_dialog(omp) == ("Allow tool: bash", ["Approve", "Deny"], 0, "Allow tool: bash\nCommand: touch /tmp/x")
+    claude = ("● Bash(touch /tmp/x)\n────────────────────\n Bash command\n\n   touch /tmp/x\n   Create marker\n\n"
+              " Do you want to proceed?\n   1. Yes\n ❯ 2. Yes, and don't ask again for touch\n      commands in /tmp\n"
+              "   3. No, and tell Claude what to do\n      differently (esc)\n\n Esc to cancel · Tab to amend\n")
+    q, labels, cur, _ = parse_dialog(claude)
+    assert q == "Do you want to proceed?" and cur == 1 and labels[2] == "No, and tell Claude what to do differently", labels
+    idle = "● Done. Options:\n  1. keep it\n  2. drop it\n────\n❯ Try \"refactor\"\n  ↑/↓ to scroll\n────\n"
+    assert parse_dialog(idle) is None  # a numbered answer and the input box are not a dialog
     print("reader ok")
 
 

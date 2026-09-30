@@ -88,6 +88,13 @@ class Herdr:
     async def send_keys(self, *keys: str) -> None:
         await _run("pane", "send-keys", self.pane, *keys)
 
+    async def select(self, steps: int) -> None:
+        """Move a TUI list's cursor `steps` rows (negative: up), then Enter."""
+        if steps:
+            await self.send_keys(*["Down" if steps > 0 else "Up"] * abs(steps))
+            await asyncio.sleep(ENTER_GAP)
+        await self.send_keys("Enter")
+
     async def read_screen(self, lines: int = 200) -> str:
         return await _run("pane", "read", self.pane, "--lines", str(lines), "--format", "text")
 

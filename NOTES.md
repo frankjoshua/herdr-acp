@@ -3,6 +3,21 @@
 Design decisions and their reasons, dated. Buzz-specific notes live in the herdr-buzz repo.
 
 ## Decisions
+- **Pane dialogs go to the client as `session/request_permission`** (2026-09-29). During a
+  turn, when Herdr says `blocked` or the turn would otherwise settle, the screen is parsed for a
+  choice dialog: a numbered list with one cursor row (`❯ 1. Yes`, Claude and Codex) or an
+  unnumbered list above a `↑/↓ navigate` hint (OMP). The settle-time check exists because Herdr
+  reports OMP's approval box as `idle`. Options keep the dialog's own labels, and their ACP kind
+  is guessed from the wording (Yes/No, "don't ask again"). The answer is typed as Up/Down from the
+  current cursor, then Enter. Digits don't work: Codex's trust dialog ignores `1`. The request
+  references the open tool call when the transcript already streamed one; otherwise it becomes a
+  `dialog-…` tool call titled with the question and carrying the dialog text. If the dialog
+  changes before the client answers (someone answered at the pane), the request is dropped
+  without `$/cancel_request`, which the SDK doesn't send. If `request_permission` fails once,
+  dialogs are left to the pane for the rest of the process. Dialogs outside a turn are not
+  asked, because a human typed that prompt at the pane. Verified live against Codex (allow and
+  reject) and OMP `--approval-mode always-ask`. Claude is verified only against a fixture shaped
+  like its Select list (`/model`), because the test Claude wasn't logged in.
 - **Pi and OMP share one reader** (2026-09-18). Pi's session format: `message` records with roles
   user / assistant / toolResult, `toolCall` blocks in assistant content. The agent holds the file open
   after its first message, so `/proc/<pid>/fd` names it; before that, the newest session under the
@@ -33,8 +48,9 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
 - **Turn end = poll `herdr pane get` every 0.5s.** `herdr agent wait --until idle` returns immediately
   if Herdr hasn't flipped the pane to `working` yet, so instead: end when status is idle/done/blocked
   for `--debounce` (2s) with no new transcript lines, after `working` was seen at least once
-  (or 10s grace if it never was — fast answers). `blocked` (permission prompt) ends the turn too;
-  the person at the pane unblocks it. Shell panes: screen unchanged for `--quiet` (5s).
+  (or 10s grace if it never was — fast answers). A choice dialog on screen holds the turn open
+  (see "Pane dialogs" above); an unparseable `blocked` screen ends the turn as idle, and the
+  person at the pane unblocks it. Shell panes: screen unchanged for `--quiet` (5s).
 
 - **Screen diff uses `difflib.SequenceMatcher`** on stripped lines; emits insert/replace lines.
   Good enough for shells; prompt-marker detection (ccgram shell_infra) only if this proves noisy.
@@ -45,6 +61,9 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
 
 ## Not yet done
 - Cancel (`session/cancel` → Escape) is only covered by the self-check, not a live agent.
+- Claude's permission dialog is not yet exercised live (see "Pane dialogs").
+- OMP's reader can pick an advisor side-file (`__advisor.scribe.jsonl`) that the agent holds
+  open, instead of the main session file (seen 2026-09-29).
 - Interleaved turns (a human typing mid-turn) are by design absorbed into the turn.
 - `--reply-from-output` for blank shells: not written.
 - Claude's folder-trust dialog on a fresh cwd blocks `herdr agent start` (`agent_not_ready`); answer it
