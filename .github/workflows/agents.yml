@@ -35,4 +35,6 @@ jobs:
           path: |
             /tmp/hacp-agents-*/*.log
             /tmp/hacp-agents-*/*/*.log
+            /tmp/hacp-agents-*/claude/cfg/projects/*/*.jsonl
+            /tmp/hacp-agents-*/claude/cfg/sessions/*.json
           retention-days: 7
