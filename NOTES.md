@@ -27,7 +27,10 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
     arrived after a dialog showed made a lost key look taken.
 - **A live suite runs the installed agents against a fake provider** (2026-09-30).
   `tests/agents.py` gives each of Claude Code, Codex, OMP, Pi, Codex inside a tmux client, and a
-  bare shell a pane on a private, headless Herdr server (`herdr --session hacp-agents-<pid> server`). Each agent gets its
+  bare shell a pane on a private, headless Herdr server (`herdr --session hacp-agents-<pid> server`).
+  Its session lives under the run's temp dir (`XDG_CONFIG_HOME`), so it never shows in the user's
+  `herdr session list`. It stops on exit, on SIGTERM, and via `PR_SET_PDEATHSIG` even if the suite
+  is killed; two orphaned servers from killed runs are why. Each agent gets its
   own HOME and config dir, so no login, no MCP servers, no skills and no user config leak in.
   herdr-acp drives each pane over ACP. `tests/fakellm.py` speaks the Anthropic Messages and
   OpenAI Responses APIs: `HACP-SAY` / `HACP-RUN` / `HACP-SLOW` markers script the answers. It reads tool names
