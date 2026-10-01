@@ -42,4 +42,6 @@ dialogs, turn ends or input, and after agent updates. CI (`.github/workflows/age
 via `tests/ci-install.sh`) runs it daily on the latest Herdr and agents. Ad hoc:
 `python tests/roundtrip.py <pane> "<prompt>"`.
 Test in a Herdr Space and pane of your own (`herdr workspace create`, `herdr agent start`), never
-in someone's working pane. Commit small, on `main`.
+in someone's working pane. Commit small, on a branch: `main` takes changes only through a PR with
+`agents` and `scan` green, and any pushed branch gets a PR that merges itself once they pass
+(`.github/workflows/automerge.yml`). Dependabot's bumps take the same path.

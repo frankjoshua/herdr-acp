@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -394,7 +395,16 @@ def scenarios(name: str) -> list:
 # ---- runner ----------------------------------------------------------------------------------
 
 def run_pane(name: str, h: Herdr, url: str, root: Path, only: str | None, results: dict) -> None:
+    """Run `name`'s scenarios into `results[name]`. Anything unexpected is a FAIL row too, so a
+    crashed pane can't leave the run looking green."""
     rows = results[name] = []
+    try:
+        _run_pane(name, h, url, root, only, rows, results)
+    except Exception:
+        rows.append(("crashed", False, traceback.format_exc()))
+
+
+def _run_pane(name: str, h: Herdr, url: str, root: Path, only: str | None, rows: list, results: dict) -> None:
     work, home = root / name / "work", root / name / "home"
     work.mkdir(parents=True)
     home.mkdir()
@@ -437,12 +447,14 @@ def main() -> int:
     a = ap.parse_args()
     panes = [p for p in a.panes if available(p)]
     skipped = [p for p in a.panes if p not in panes]
+    if a.only:  # a pane without that scenario doesn't run at all
+        panes = [p for p in panes if any(s == a.only for s, _ in scenarios(p))]
     root = Path(tempfile.mkdtemp(prefix="hacp-agents-"))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # killed (e.g. by `timeout`): still clean up
+    h = Herdr(f"hacp-agents-{os.getpid()}", root)  # first: its preexec_fn must not run in a threaded process
     log = open(root / "fakellm.log", "w")
     server = fakellm.serve(0, log, None)
     url = f"http://127.0.0.1:{server.server_address[1]}"
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # killed (e.g. by `timeout`): still clean up
-    h = Herdr(f"hacp-agents-{os.getpid()}", root)
     results, t = {}, time.monotonic()
     try:
         threads = [threading.Thread(target=run_pane, args=(p, h, url, root, a.only, results)) for p in panes]
@@ -456,7 +468,8 @@ def main() -> int:
             subprocess.run(["tmux", "-L", TMUX, "kill-server"], capture_output=True)
         server.shutdown()
         log.close()
-    ok = all(passed for k, rows in results.items() if not k.endswith(":herdr") for _, passed, _ in rows)
+    # every selected pane must have run and passed something: no rows means it never got to run
+    ok = all(results.get(p) and all(passed for _, passed, _ in results[p]) for p in panes)
     for p in panes:
         print(f"\n{p}: {version(p)} (Herdr detects: {results.get(p + ':herdr', '?')})")
         for sname, passed, note in results.get(p, []):
