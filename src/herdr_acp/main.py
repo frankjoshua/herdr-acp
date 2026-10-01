@@ -75,6 +75,7 @@ class PaneAgent:
         # which Claude may write just after its dialog shows), and Herdr seeing the agent leave blocked.
         self.results = 0
         self.unblocked = 0
+        self.herdr_status = None  # the pane's agent status as Herdr last reported it
         self.repick = True  # the agent may have changed (Herdr said so): re-pick the reader on the next pass
         self.pumping = asyncio.Lock()  # one reader pass at a time
         self.changed = asyncio.Condition()
@@ -175,12 +176,16 @@ class PaneAgent:
 
     async def _follow(self) -> None:
         """Herdr's events for the pane: flag a reader re-pick when the agent changes (so a
-        restarted agent is followed), and count every status change away from blocked."""
+        restarted agent is followed), and count each time the agent leaves blocked (a stale
+        `working` from the turn's start, arriving after a dialog showed, is not one)."""
         while True:
             try:
                 async for _, data in self.transport.events():
-                    if data.get("agent_status") not in (None, "blocked"):
-                        self.unblocked += 1
+                    status = data.get("agent_status")
+                    if status:
+                        if self.herdr_status == "blocked" and status != "blocked":
+                            self.unblocked += 1
+                        self.herdr_status = status
                     if "agent" in data:
                         self.agent = None if data.get("released") else data["agent"]
                     self.repick = True
@@ -198,12 +203,13 @@ class PaneAgent:
         text = "\n".join(b.text for b in prompt if getattr(b, "type", None) == "text")
         if self.footer:
             text += "\n\n" + self.footer
-        self.recent_prompts = (self.recent_prompts + [text.strip()])[-5:]
         self.cancelled = self.dismissed = False
-        self.agent, self.repick = (await self.transport.info()).get("agent"), True
+        info = await self.transport.info()
+        self.agent, self.herdr_status, self.repick = info.get("agent"), info.get("agent_status"), True
         if open_dialog := parse_dialog(await self.transport.read_visible()):  # typing now would land in it
             raise RequestError.invalid_request({"reason": "the pane is waiting on a dialog", "dialog": open_dialog.question})
         await self._pump()  # picks the reader; anything already written belongs before this prompt
+        self.recent_prompts = (self.recent_prompts + [text.strip()])[-5:]  # only a prompt actually sent
         if not isinstance(self.reader, ScreenDiff):
             stop = await self._transcript_turn(text)
         elif self.agent:
@@ -226,8 +232,8 @@ class PaneAgent:
             try:
                 if self.agent:
                     await self.transport.prompt(text)  # Herdr refuses (agent_blocked) while a dialog is open
-                else:  # an agent Herdr can't see (codex under tmux)
-                    await self.transport.send(text)
+                else:  # an agent Herdr can't see (codex under tmux): we type it, and check it went
+                    await self._type(text, starts)
             except HerdrError as e:
                 if e.code != "agent_prompt_stalled":
                     raise
@@ -326,8 +332,8 @@ class PaneAgent:
                 self.dismissed = True
                 await self._press(dialog, moved, lambda now: self.transport.send_keys("esc"))
                 await self._pump()
-                if self.ended <= self.turn_starts:  # Esc only denied the tool and the agent goes on (OMP): stop it
-                    await self.transport.send_keys("esc")
+                if getattr(self.reader, "kind", None) == "omp" and self.ended <= self.turn_starts:
+                    await self.transport.send_keys("esc")  # OMP: Esc only denied the tool and the turn goes on
                 self.cancelled = True  # session/cancel that follows sends no further Esc
                 await self._notify()
                 return
@@ -339,6 +345,23 @@ class PaneAgent:
         finally:
             req.cancel()
             gone.cancel()
+
+    async def _type(self, text: str, starts: int) -> None:
+        """Type a prompt and Enter, then confirm the agent took it: its transcript records the user
+        message. Through a tmux client an Enter can arrive with the pasted text and be swallowed
+        (seen: the prompt sat unsent in Codex's input box), so it is pressed again if nothing is
+        recorded within KEY_TAKEN. An extra Enter on an emptied input box does nothing."""
+        await self.transport.send(text)
+        for _ in range(PRESSES - 1):
+            try:
+                await asyncio.wait_for(self._until(lambda: self.starts > starts), KEY_TAKEN)
+                return
+            except asyncio.TimeoutError:
+                await self._pump()
+                if self.starts > starts:
+                    return
+                log.info("the prompt wasn't submitted; pressing Enter again")
+                await self.transport.send_keys("enter")
 
     async def _press(self, dialog, moved, press) -> None:
         """`press(dialog now on screen)` until the agent takes it: the agent moves on or that
@@ -385,17 +408,18 @@ def _selfcheck() -> None:
               " Esc to cancel · Tab to amend\n")
 
     class Reader:  # a transcript: poll() hands out what the script pushed
-        def __init__(self): self.queue = []
+        def __init__(self, kind): self.queue, self.kind = [], kind
         def push(self, *items): self.queue += items
         async def poll(self): out, self.queue = self.queue, []; return out
 
     class Pane:  # a scripted Herdr pane; `on_prompt`/`on_select` play the agent
-        def __init__(self, agent="claude", on_prompt=None, on_select=None, deaf=0):
+        def __init__(self, agent="claude", on_prompt=None, on_select=None, deaf=0, herdr_sees=True):
             self.agent, self.on_prompt, self.on_select = agent, on_prompt, on_select
             self.screen, self.sent, self.keys, self.selected = "", [], [], []
             self.fg, self.events_q = [True], asyncio.Queue()
-            self.deaf = deaf  # how many dialog keys the agent drops (a dialog drawn before it listens)
-        async def info(self): return {"pane_id": "fake", "agent": self.agent}
+            self.deaf = deaf  # how many keys the agent drops (a dialog drawn before it listens, an Enter in a paste)
+            self.herdr_sees = herdr_sees  # False: behind a tmux client, Herdr reports no agent
+        async def info(self): return {"pane_id": "fake", "agent": self.agent if self.herdr_sees else None}
         async def process(self): return (1, self.agent)
         async def events(self):
             while True:
@@ -405,18 +429,20 @@ def _selfcheck() -> None:
             return await self.on_prompt(self)
         async def send(self, text):
             self.sent.append(text)
-            if self.on_prompt:
+            if self.on_prompt and not (self.agent and self._deaf()):  # an agent may swallow the Enter
                 await self.on_prompt(self)
         def _deaf(self):
             self.deaf -= 1
             return self.deaf >= 0
         async def send_keys(self, *keys):
             self.keys += keys
+            if keys == ("enter",) and not self.screen and self.on_prompt:  # Enter on the unsent prompt
+                await self.on_prompt(self)
             if "esc" in keys and self.screen and not self._deaf():  # Esc on the dialog: closed, Herdr sees it unblock
                 self.screen = ""
                 self.events_q.put_nowait({"pane_id": "fake", "agent": self.agent, "agent_status": "idle"})
-                if self.agent != "omp":  # Claude and Codex end the turn there; OMP only denies the tool and goes on
-                    self.reader.push(TURN_END)
+                if self.agent != "omp":  # Claude and Codex end the turn there (marker written a bit later);
+                    asyncio.ensure_future(later(0.05, lambda: self.reader.push(TURN_END)))  # OMP goes on
         async def select(self, steps, row, timeout_ms=5000):
             self.selected.append((steps, row))
             if not self._deaf():
@@ -432,7 +458,7 @@ def _selfcheck() -> None:
     class Agent(PaneAgent):  # the script's reader (shared with the pane script) instead of a real transcript
         async def _pick_reader(self):
             p = self.transport
-            self.reader = self.reader or (Reader() if p.agent in KNOWN else ScreenDiff(p.read_screen))
+            self.reader = self.reader or (Reader(p.agent) if p.agent in KNOWN else ScreenDiff(p.read_screen))
             p.reader = self.reader
 
     class Conn:
@@ -449,8 +475,8 @@ def _selfcheck() -> None:
                 self.dropped += 1
                 raise
 
-    def said(a):
-        return [u.content.text for u in a.conn.ups if u.session_update == "agent_message_chunk"]
+    def said(a, kind="agent_message_chunk"):
+        return [u.content.text for u in a.conn.ups if u.session_update == kind]
 
     async def run(pane, answer=None, on_ask=None, mid=None, text="hi", footer="reply here"):
         a = Agent(pane, footer=footer)
@@ -517,11 +543,21 @@ def _selfcheck() -> None:
             assert e.code == "agent_blocked", e
         pane = Pane(on_prompt=lambda p: asyncio.Event().wait())
         pane.screen = DIALOG
+        a = Agent(pane, footer="")
+        a.on_connect(Conn())
+        sid = (await a.new_session("/tmp")).session_id
         try:
-            await run(pane)
+            await a.prompt(sid, [text_block("same words")])
             raise AssertionError("prompt typed into an open dialog")
         except RequestError as e:
             assert e.data["dialog"] == "Do you want to proceed?" and pane.sent == [], (e.data, pane.sent)
+        # the refused prompt was never typed, so the same words typed by a human later are theirs
+        await a._pump()
+        a.reader.push(update_user_message_text("same words"))
+        await a._pump()
+        assert said(a, "user_message_chunk") == ["same words"], a.conn.ups
+        for t in a.tasks:
+            t.cancel()
 
         # (e) a dialog goes to the client against the open tool call; the choice is typed once the
         # cursor is on it (cursor on 1, "3." chosen: 2 rows down, regex on the "3. No" row)
@@ -558,6 +594,8 @@ def _selfcheck() -> None:
         # (g) the same, seen only by Herdr (Codex records nothing until the command is done): the
         # agent leaving blocked drops the request; a late "blocked" event does not
         async def herdr_sees_it(a):
+            # a stale "working" from the turn's start, arriving after the dialog showed, is not an answer
+            a.transport.events_q.put_nowait({"pane_id": "fake", "agent": "claude", "agent_status": "working"})
             a.transport.events_q.put_nowait({"pane_id": "fake", "agent": "claude", "agent_status": "blocked"})
             await asyncio.sleep(0.02)
             assert a.conn.dropped == 0, "a blocked event closed the dialog"
@@ -569,6 +607,12 @@ def _selfcheck() -> None:
         pane = Pane(on_prompt=tool_then_dialog)
         stop, a = await run(pane, answer=never, on_ask=herdr_sees_it)
         assert stop == "end_turn" and pane.selected == [] and len(a.conn.asked) == 1
+
+        # an agent Herdr can't see (Codex behind tmux) swallows the Enter of the typed prompt: pressed
+        # again once nothing is recorded; the turn then runs normally
+        pane = Pane(agent="codex", herdr_sees=False, deaf=1, on_prompt=answers)
+        stop, a = await run(pane)
+        assert stop == "end_turn" and said(a) == ["hello"] and pane.keys == ["enter"], (stop, said(a), pane.keys)
 
         # (h) a client that can't answer: asked once, then dialogs are left to the pane
         async def fail():
