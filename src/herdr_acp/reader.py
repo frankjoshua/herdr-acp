@@ -5,7 +5,8 @@ CodexRollout tails <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl the same way
 PiSession tails a Pi-format session (Pi, OMP): <agent dir>/sessions/<cwd>/<ts>_<id>.jsonl.
 ScreenDiff diffs successive plain-text screen snapshots (floor for shells / unknown agents).
 `parse_dialog(screen)` finds an approval/question dialog waiting at the bottom of the pane.
-All expose `async poll() -> list[update]`. `claude_transcript_for(pid)` / `codex_rollout_for(pid)` /
+All expose `async poll() -> list[update]`. The transcript readers also put TURN_END where the
+agent recorded the end of a turn. `claude_transcript_for(pid)` / `codex_rollout_for(pid)` /
 `pi_session_for(pid, kind)` find the file from the agent process itself (`proc_info`).
 """
 
@@ -15,7 +16,7 @@ import json
 import logging
 import os
 import re
-import time
+from typing import NamedTuple
 
 from acp import (
     start_tool_call,
@@ -29,7 +30,8 @@ from acp import (
 
 log = logging.getLogger("herdr-acp")
 PROC = "/proc"  # discovery is process-first (env, cwd, open files); the only glob is the cwd-scoped
-# fallback for a Codex that has not opened its rollout yet.
+# fallback for an agent that has not opened its session file yet.
+TURN_END = "turn_end"  # in a reader's updates: the agent recorded the end of a turn here
 
 TOOL_KIND = {
     "Bash": "execute", "Read": "read", "Edit": "edit", "Write": "edit", "NotebookEdit": "edit",
@@ -40,18 +42,23 @@ TOOL_KIND = {
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]")
 
 
+def open_files(pid: int) -> list[str]:
+    """Paths the process holds open (/proc/<pid>/fd)."""
+    out = []
+    for fd in os.listdir(f"{PROC}/{pid}/fd"):
+        try:
+            out.append(os.readlink(f"{PROC}/{pid}/fd/{fd}"))
+        except OSError:
+            pass
+    return out
+
+
 def proc_info(pid: int) -> dict:
     """What the agent process tells us about itself: env, cwd, open files, start time."""
     base = f"{PROC}/{pid}"
     with open(f"{base}/environ", "rb") as f:
         env = dict(kv.split("=", 1) for kv in f.read().decode("utf-8", "replace").split("\0") if "=" in kv)
-    fds = []
-    for fd in os.listdir(f"{base}/fd"):
-        try:
-            fds.append(os.readlink(f"{base}/fd/{fd}"))
-        except OSError:
-            pass
-    return {"env": env, "cwd": os.readlink(f"{base}/cwd"), "fds": fds, "started": os.stat(base).st_mtime}
+    return {"env": env, "cwd": os.readlink(f"{base}/cwd"), "fds": open_files(pid), "started": os.stat(base).st_mtime}
 
 
 def claude_transcript(cfg_dir: str, session: dict) -> str:
@@ -86,6 +93,8 @@ def updates_from_entry(entry: dict) -> list:
     if entry.get("isSidechain"):
         return []  # ponytail: subagent traffic skipped; surface as nested tool_call later if wanted
     kind = entry.get("type")
+    if kind == "system" and entry.get("subtype") == "turn_duration":  # Claude closes every turn with it
+        return [TURN_END]
     content = (entry.get("message") or {}).get("content")
     if kind == "user" and isinstance(content, str):  # a human typed in the pane
         text = content.strip()
@@ -182,6 +191,8 @@ def _item_text(content) -> str:
 def codex_updates(entry: dict) -> list:
     """Map one rollout line to ACP updates (only `item_completed` events carry anything)."""
     p = entry.get("payload") or {}
+    if entry.get("type") == "event_msg" and p.get("type") in ("task_complete", "turn_aborted"):
+        return [TURN_END]
     if entry.get("type") != "event_msg" or p.get("type") != "item_completed":
         return []
     it = p.get("item") or {}
@@ -215,25 +226,25 @@ def codex_updates(entry: dict) -> list:
     return []
 
 
+def _is_rollout(path: str) -> bool:
+    return "/sessions/" in path and os.path.basename(path).startswith("rollout-") and path.endswith(".jsonl")
+
+
 def codex_rollout_for(pid: int) -> str | None:
     p = proc_info(pid)
-    for f in p["fds"]:
-        if "/sessions/" in f and os.path.basename(f).startswith("rollout-") and f.endswith(".jsonl"):
-            return f
-    return codex_rollout(p["cwd"], p["env"].get("CODEX_HOME") or os.path.expanduser("~/.codex"), p["started"])
+    return next(filter(_is_rollout, p["fds"]), None) \
+        or codex_rollout(p["cwd"], p["env"].get("CODEX_HOME") or os.path.expanduser("~/.codex"), p["started"])
 
 
 class CodexRollout:
     def __init__(self, pid: int, path: str | None = None):
         self.pid = pid
-        self.path = path or codex_rollout_for(pid)  # None until Codex opens its rollout
+        self.path = path or codex_rollout_for(pid)  # None until Codex creates its rollout
         self.offset = os.path.getsize(self.path) if self.path else 0
-        self.checked = 0.0
 
     async def poll(self) -> list:
-        if not self.path and time.monotonic() - self.checked >= 2:
-            self.checked = time.monotonic()
-            self.path, self.offset = codex_rollout_for(self.pid), 0
+        if not self.path:  # Codex holds the rollout open once it exists
+            self.path, self.offset = next(filter(_is_rollout, open_files(self.pid)), None), 0
         if not self.path:
             return []
         out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, codex_updates)
@@ -271,11 +282,15 @@ def pi_session(cwd: str, sessions_dir: str, newer_than: float = 0.0) -> str | No
     return best[1] if best else None
 
 
+def _is_pi_session(path: str) -> bool:
+    """A session file; OMP also holds side files (`__advisor.scribe.jsonl`) under the session's dir."""
+    return "/sessions/" in path and path.endswith(".jsonl") and not os.path.basename(path).startswith("__")
+
+
 def pi_session_for(pid: int, kind: str) -> str | None:
     p = proc_info(pid)
-    for f in p["fds"]:
-        if "/sessions/" in f and f.endswith(".jsonl"):
-            return f
+    if found := next(filter(_is_pi_session, p["fds"]), None):
+        return found
     agent_dir = p["env"].get("PI_CODING_AGENT_DIR") or os.path.expanduser(f"~/.{kind}/agent")
     sessions = p["env"].get("PI_CODING_AGENT_SESSION_DIR") or os.path.join(agent_dir, "sessions")
     return pi_session(p["cwd"], sessions, p["started"])
@@ -307,6 +322,8 @@ def pi_updates(entry: dict) -> list:
             name, args = b.get("name", "tool"), b.get("arguments") or {}
             out.append(start_tool_call(b.get("id", ""), _tool_title(name, args), kind=PI_TOOL_KIND.get(name, "other"),
                                        status="in_progress", raw_input=args))
+    if m.get("stopReason") not in (None, "toolUse"):  # stop, aborted, error, length: the turn is over
+        out.append(TURN_END)
     return out
 
 
@@ -315,12 +332,10 @@ class PiSession:
         self.pid, self.kind = pid, kind
         self.path = path or pi_session_for(pid, kind)  # None until the first message creates it
         self.offset = os.path.getsize(self.path) if self.path else 0
-        self.checked = 0.0
 
     async def poll(self) -> list:
-        if not self.path and time.monotonic() - self.checked >= 2:
-            self.checked = time.monotonic()
-            self.path, self.offset = pi_session_for(self.pid, self.kind), 0
+        if not self.path:  # the agent holds its session open once the first message exists
+            self.path, self.offset = next(filter(_is_pi_session, open_files(self.pid)), None), 0
         if not self.path:
             return []
         out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, pi_updates)
@@ -358,6 +373,27 @@ NUMBERED = re.compile(rf"^(\s*)([{CURSOR}]\s*)?(\d+)\.\s+(\S.*)$")  # Claude, Co
 SHORTCUT = re.compile(r"\s+\((?:esc|[a-z])\)$")  # Codex: "Yes, proceed (y)"
 FRAME = "─━═▔╭╮╰╯├┤┌┐└┘"
 DIALOG_ROWS = 25  # a dialog waiting for an answer sits at the bottom of the screen
+# A row that may belong to a dialog, as a Rust regex for Herdr's wait_for_output: a cursor on a
+# numbered option (Claude, Codex) or a "↑/↓ navigate" hint (OMP). parse_dialog decides.
+DIALOG_HINT = rf"^\s*[│┃║]?\s*[{CURSOR}]\s*\d+\.\s|↑/?↓"
+
+
+class Dialog(NamedTuple):
+    question: str
+    labels: list[str]  # one per option, wrapped rows joined, shortcut hints dropped
+    cursor: int  # index of the selected option
+    text: str  # what the dialog shows above its options
+    heads: list[str]  # each option's first screen row, after the cursor column
+
+
+def _rx(s: str) -> str:
+    """`s` as a literal in a Rust regex."""
+    return "".join("\\" + c if c in r"\.+*?()|[]{}^$#&-~" else c for c in s)
+
+
+def cursor_on(dialog: Dialog, i: int) -> str:
+    """Rust regex matching option `i`'s row once the cursor is on it."""
+    return rf"[{CURSOR}]\s*{_rx(dialog.heads[i])}"
 
 
 def _unbox(line: str) -> str:
@@ -369,27 +405,28 @@ def _unbox(line: str) -> str:
     return line.rstrip()
 
 
-def _numbered(rows: list[str]) -> tuple[int, list[str], int] | None:
-    """The last "1. … 2. …" list with exactly one cursor row: (first row, labels, cursor index)."""
-    found, run = None, None  # run: [first row, labels, cursor indexes, label column]
+def _numbered(rows: list[str]) -> tuple[int, list[str], int, list[str]] | None:
+    """The last "1. … 2. …" list with exactly one cursor row: (first row, labels, cursor index, heads)."""
+    found, run = None, None  # run: [first row, labels, cursor indexes, label column, heads]
     for i, row in enumerate(rows):
         m = NUMBERED.match(row)
         if m and int(m[3]) == 1:
-            run = [i, [m[4]], [0] if m[2] else [], m.start(4)]
+            run = [i, [m[4]], [0] if m[2] else [], m.start(4), [row[m.start(3):].rstrip()]]
         elif m and run and int(m[3]) == len(run[1]) + 1:
             run[1].append(m[4])
             run[2] += [len(run[1]) - 1] if m[2] else []
             run[3] = m.start(4)
+            run[4].append(row[m.start(3):].rstrip())
         elif run and row.strip() and len(row) - len(row.lstrip()) >= run[3]:
             run[1][-1] += " " + row.strip()  # a label wrapped onto the next row
         else:
             run = None
         if run and len(run[1]) >= 2 and len(run[2]) == 1:
-            found = (run[0], list(run[1]), run[2][0])
+            found = (run[0], list(run[1]), run[2][0], list(run[4]))
     return found
 
 
-def _navigated(rows: list[str]) -> tuple[int, list[str], int] | None:
+def _navigated(rows: list[str]) -> tuple[int, list[str], int, list[str]] | None:
     """An unnumbered list right above a "↑/↓ navigate" hint (OMP): one cursor row, the other rows
     indented to the cursor row's label."""
     hint = next((i for i in range(len(rows) - 1, -1, -1) if "↑/↓" in rows[i] or "↑↓" in rows[i]), None)
@@ -409,18 +446,18 @@ def _navigated(rows: list[str]) -> tuple[int, list[str], int] | None:
     col = len(marked) - len(marked.lstrip()[1:].lstrip())
     if any(len(o) - len(o.lstrip()) != col for i, o in enumerate(opts) if i != cursors[0]):
         return None
-    return start, [o.strip().lstrip(CURSOR).strip() for o in opts], cursors[0]
+    labels = [o.strip().lstrip(CURSOR).strip() for o in opts]
+    return start, labels, cursors[0], labels
 
 
-def parse_dialog(screen: str) -> tuple[str, list[str], int, str] | None:
-    """(question, option labels, cursor index, dialog text) of the choice dialog waiting at the
-    bottom of the pane (an approval or a question), or None. The text is what sits above the
-    options, up to a frame or a double blank line."""
+def parse_dialog(screen: str) -> Dialog | None:
+    """The choice dialog waiting at the bottom of the pane (an approval or a question), or None.
+    Its text is what sits above the options, up to a frame or a double blank line."""
     rows = [_unbox(r) for r in ANSI.sub("", screen).splitlines()][-DIALOG_ROWS:]
     hit = _numbered(rows) or _navigated(rows)
     if not hit:
         return None
-    first, labels, cursor = hit
+    first, labels, cursor, heads = hit
     above, blank = [], False
     for row in reversed(rows[:first]):
         s = row.strip()
@@ -436,7 +473,7 @@ def parse_dialog(screen: str) -> tuple[str, list[str], int, str] | None:
             break  # a rule, or the top of the dialog's frame ("╭─ Allow tool: bash ─╮", title kept)
     text = "\n".join(reversed(above))
     question = next((a for a in reversed(text.splitlines()) if a.endswith("?")), text.split("\n", 1)[0])
-    return question, [SHORTCUT.sub("", lb) for lb in labels], cursor, text
+    return Dialog(question, [SHORTCUT.sub("", lb) for lb in labels], cursor, text, heads)
 
 
 def option_kind(label: str) -> str:
@@ -497,6 +534,11 @@ def _selfcheck() -> None:
         assert [u.content.text for u in await r.poll()] == ["done"]
         append(path, "{not json\n", text("after"))
         assert [u.content.text for u in await r.poll()] == ["after"]
+        # every turn ends with turn_duration, also an interrupted one; a subagent's doesn't count
+        append(path, {"type": "user", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}},
+               {"type": "system", "subtype": "turn_duration", "isSidechain": True},
+               {"type": "system", "subtype": "turn_duration"})
+        assert await r.poll() == [TURN_END]
 
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(go(tmp))
@@ -536,6 +578,9 @@ def _selfcheck() -> None:
     assert [u.session_update for u in ups] == ["user_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
                                               "tool_call", "tool_call_update", "agent_message_chunk"], [u.session_update for u in ups]
     assert ups[2].title == "exec: pwd" and ups[3].content[0].content.text == "/work\n" and ups[4].title == "edit: a.py"
+    for end in ("task_complete", "turn_aborted"):  # a finished turn, a rejected one
+        assert codex_updates({"type": "event_msg", "payload": {"type": end}}) == [TURN_END], end
+    assert codex_updates({"type": "event_msg", "payload": {"type": "task_started"}}) == []
     # Pi/OMP: session found by cwd under the agent dir, message roles → updates
     home = tempfile.mkdtemp()
     d = os.path.join(home, "sessions", "-work"); os.makedirs(d)
@@ -555,46 +600,60 @@ def _selfcheck() -> None:
     with open(sess, "a") as f:
         for row in [
             {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "run pwd"}]}},
-            {"type": "message", "message": {"role": "assistant", "content": [
+            {"type": "message", "message": {"role": "assistant", "stopReason": "toolUse", "content": [
                 {"type": "thinking", "thinking": "ok"}, {"type": "text", "text": "Sure."},
                 {"type": "toolCall", "id": "t1", "name": "bash", "arguments": {"command": "pwd"}}]}},
             {"type": "custom", "customType": "tool_execution_start", "data": {"toolCallId": "t1"}},
             {"type": "message", "message": {"role": "toolResult", "toolCallId": "t1", "toolName": "bash",
                                             "content": [{"type": "text", "text": "/work\n"}]}},
-            {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}},
+            {"type": "message", "message": {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "done"}]}},
         ]:
             f.write(json.dumps(row) + "\n")
     ups = asyncio.run(r.poll())
-    assert [u.session_update for u in ups] == ["user_message_chunk", "agent_thought_chunk", "agent_message_chunk",
-                                              "tool_call", "tool_call_update", "agent_message_chunk"], [u.session_update for u in ups]
+    assert [u if u == TURN_END else u.session_update for u in ups] == [
+        "user_message_chunk", "agent_thought_chunk", "agent_message_chunk", "tool_call", "tool_call_update",
+        "agent_message_chunk", TURN_END], ups
     assert ups[3].title == "bash: pwd" and ups[3].kind == "execute" and ups[4].content[0].content.text == "/work\n"
+    # OMP holds advisor side files open next to the session; they are not the session
+    assert _is_pi_session("/h/.omp/agent/sessions/-w/2026_x.jsonl")
+    assert not _is_pi_session("/h/.omp/agent/sessions/-w/2026_x/__advisor.scribe.jsonl")
     # dialogs, as `herdr pane read` shows them in a 44-column pane
     codex = ("\n\n  Would you like to run the following com\n\n  Environment: local\n\n  Reason: Allow creating\n"
              "  /tmp/x with the\n  [… 9 lines] ctrl + a view all\n\n› 1. Yes, proceed (y)\n"
              "  2. Yes, and don't ask again for\n     commands that start with `touch /\n     tmp/x` (p)\n"
              "  3. No, and tell Codex what to do\n     differently (esc)\n\n  Press enter to confirm or esc to cancel\n")
-    q, labels, cur, txt = parse_dialog(codex)
-    assert labels == ["Yes, proceed", "Yes, and don't ask again for commands that start with `touch / tmp/x`",
-                      "No, and tell Codex what to do differently"] and cur == 0, labels
-    assert q == "Would you like to run the following com" and txt.endswith("ctrl + a view all"), (q, txt)
-    assert [option_kind(lb) for lb in labels] == ["allow_once", "allow_always", "reject_once"]
+    d = parse_dialog(codex)
+    assert d.labels == ["Yes, proceed", "Yes, and don't ask again for commands that start with `touch / tmp/x`",
+                        "No, and tell Codex what to do differently"] and d.cursor == 0, d.labels
+    assert d.question == "Would you like to run the following com" and d.text.endswith("ctrl + a view all"), d
+    assert [option_kind(lb) for lb in d.labels] == ["allow_once", "allow_always", "reject_once"]
+    # the row regex Herdr waits on: matches option 2 only once the cursor sits on it
+    moved = codex.replace("› 1. Yes", "  1. Yes").replace("  2. Yes, and", "› 2. Yes, and")
+    assert d.heads[1] == "2. Yes, and don't ask again for", d.heads
+    assert re.search(cursor_on(d, 1), moved, re.M) and not re.search(cursor_on(d, 1), codex, re.M)
     omp = ("│ $ touch /tmp/x    │\n╰────────────╯\n\n  \uf12b7 Creating marker file\n"
            "╭─ Allow tool: bash ─────────╮\n│                            │\n│ Command: touch /tmp/x      │\n"
            "│                            │\n│  \uf054 Approve                 │\n│    Deny                    │\n"
            "│                            │\n│ ↑/↓ navigate  \U000f0311 select  \uf12b7 cancel │\n"
            "╰────────────────────────────╯\n personal\nthink:high\n")
-    assert parse_dialog(omp) == ("Allow tool: bash", ["Approve", "Deny"], 0, "Allow tool: bash\nCommand: touch /tmp/x")
+    d = parse_dialog(omp)
+    assert d[:4] == ("Allow tool: bash", ["Approve", "Deny"], 0, "Allow tool: bash\nCommand: touch /tmp/x"), d
+    moved = omp.replace("\uf054 Approve", "  Approve").replace("│    Deny", "│  \uf054 Deny")
+    assert re.search(cursor_on(d, 1), moved, re.M) and not re.search(cursor_on(d, 1), omp, re.M)
     claude = ("● Creating the marker file\n  ⎿  $ touch /tmp/x\n────────────────────\n Bash command\n\n"  # Claude 2.1.285
               " Tip: auto mode handles these prompts for you — choose \"switch to auto mode\" below\n\n"
               "   touch /tmp/x\n   Create the marker file\n\n Do you want to proceed?\n ❯ 1. Yes\n"
               "   2. Yes, and always allow access to /tmp from this project\n"
               "   3. Yes, and switch to auto mode · auto mode handles these prompts for you\n   4. No\n\n"
               " Esc to cancel · Tab to amend\n")
-    q, labels, cur, _ = parse_dialog(claude)
+    q, labels, cur, _, _ = parse_dialog(claude)
     assert q == "Do you want to proceed?" and cur == 0 and len(labels) == 4, (q, labels)
     assert [option_kind(lb) for lb in labels] == ["allow_once", "allow_always", "allow_once", "reject_once"]
     idle = "● Done. Options:\n  1. keep it\n  2. drop it\n────\n❯ Try \"refactor\"\n  ↑/↓ to scroll\n────\n"
     assert parse_dialog(idle) is None  # a numbered answer and the input box are not a dialog
+    # the trigger fires on every dialog shape; an input box ("❯ Try …") or a plain list doesn't fire it
+    assert all(re.search(DIALOG_HINT, s, re.M) for s in (codex, omp, claude))
+    assert not re.search(DIALOG_HINT, "● Options:\n  1. keep it\n  2. drop it\n────\n❯ Try \"refactor\"\n", re.M)
     print("reader ok")
 
 

@@ -22,16 +22,17 @@ call and record it in `NOTES.md` (decisions and their reasons, dated).
   self-check per non-trivial piece of logic (`python -m herdr_acp.<module>`).
 
 ## Layout (`src/herdr_acp/`)
-- `transport.py` — the `herdr` CLI: state, process (sees through a tmux client), send text/keys,
-  read screen.
+- `transport.py` — Herdr's socket API: process (sees through a tmux client), send text/keys,
+  submit a prompt, select a list entry, read screen, wait for output, agent events.
 - `reader.py` — what happened in the pane, as ACP updates. Transcript discovery reads the agent
   *process* (PID from Herdr): Claude's `<cfg>/sessions/<pid>.json` names the transcript; Codex and
   Pi/OMP hold their session file open in `/proc/<pid>/fd`. Screen diff is the floor for a bare shell.
   `parse_dialog` reads an approval/question dialog off the screen.
 - `main.py` — the ACP server: `initialize`, `session/new` (starts the tail), `session/prompt`
-  (type, wait for idle + debounce; a dialog becomes `session/request_permission` and the choice is
-  typed back), `session/cancel` (Escape). Reader is keyed on the agent PID
-  and re-picked every 5s so a restarted agent is followed.
+  (type; the turn ends at the transcript's turn-end marker, a shell's return to its prompt, or
+  Herdr's settle for agents without a reader; a dialog becomes `session/request_permission` and
+  the choice is typed back), `session/cancel` (Escape). Reader is keyed on the agent PID and
+  re-picked when Herdr reports the pane's agent changed. No decision waits out a delay.
 
 Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.main --selfcheck`,
 `python -m herdr_acp.transport <pane>`; live: `python tests/roundtrip.py <pane> "<prompt>"`.
