@@ -13,11 +13,13 @@ the fake reads tool names and argument schemas from each request.
 """
 
 import argparse
+import ctypes
 import json
 import os
 import queue
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -46,12 +48,16 @@ def check(cond, msg):
 # ---- the private Herdr server ----------------------------------------------------------------
 
 class Herdr:
-    """`herdr --session <name> server`, headless; every CLI call here targets it."""
+    """`herdr --session <name> server`, headless, its session kept under `root` (XDG_CONFIG_HOME),
+    so nothing shows in the user's `herdr session list`. It stops when the suite exits, even if
+    the suite is killed (PR_SET_PDEATHSIG). Every CLI call here targets it."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, root: Path):
         self.name = name
         self.env = {k: v for k, v in os.environ.items() if k not in HERDR_VARS}
-        self.proc = subprocess.Popen(["herdr", "--session", name, "server"], env=self.env,
+        self.env["XDG_CONFIG_HOME"] = str(root / "xdg")
+        die_with_suite = lambda: ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # noqa: E731  PR_SET_PDEATHSIG
+        self.proc = subprocess.Popen(["herdr", "--session", name, "server"], env=self.env, preexec_fn=die_with_suite,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.socket = None
         for line in self.proc.stdout:  # "api socket: <path>" once it listens
@@ -434,7 +440,8 @@ def main() -> int:
     log = open(root / "fakellm.log", "w")
     server = fakellm.serve(0, log, None)
     url = f"http://127.0.0.1:{server.server_address[1]}"
-    h = Herdr(f"hacp-agents-{os.getpid()}")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # killed (e.g. by `timeout`): still clean up
+    h = Herdr(f"hacp-agents-{os.getpid()}", root)
     results, t = {}, time.monotonic()
     try:
         threads = [threading.Thread(target=run_pane, args=(p, h, url, root, a.only, results)) for p in panes]
