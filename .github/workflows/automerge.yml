@@ -7,6 +7,8 @@ on:
     branches-ignore: [main]
   pull_request:
     types: [opened, reopened, ready_for_review]
+  schedule:
+    - cron: "43 7 * * *"
 permissions:
   contents: read
 jobs:
@@ -29,8 +31,34 @@ jobs:
         if: github.event_name == 'push'
         run: |
           if [ -z "$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[].number')" ]; then
-            gh pr create --head "$BRANCH" --base main --title "$(gh api "repos/$GH_REPO/commits/$GITHUB_SHA" --jq '.commit.message | split("\n")[0]')" \
+            title=$(gh api "repos/$GH_REPO/compare/main...$GITHUB_SHA" --jq '.commits[0].commit.message | split("\n")[0]')
+            gh pr create --head "$BRANCH" --base main --title "${title:-$BRANCH}" \
               --body "Opened by the auto-merge workflow for \`$BRANCH\`; merges itself once the required checks pass."
           fi
       - name: Merge once the required checks pass
-        run: gh pr merge "$BRANCH" --auto --squash  # the repo deletes merged branches
+        run: gh pr merge "$BRANCH" --auto --squash
+
+  # A merge done with the workflow token doesn't trigger the repo's "delete branch on merge", so
+  # merged branches are removed here: only while still at the merged commit (newer work survives).
+  cleanup:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Delete branches whose PR has merged
+        run: |
+          gh pr list --state merged --base main --limit 100 --json headRefName,headRefOid,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository | not) | "\(.headRefName) \(.headRefOid)"' |
+          while read -r ref oid; do
+            [ "$ref" = main ] && continue
+            now=$(gh api "repos/$GH_REPO/git/ref/heads/$ref" --jq .object.sha 2>/dev/null) || continue
+            if [ "$now" = "$oid" ]; then
+              gh api -X DELETE "repos/$GH_REPO/git/refs/heads/$ref" && echo "deleted $ref"
+            fi
+          done
