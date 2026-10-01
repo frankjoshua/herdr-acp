@@ -9,6 +9,17 @@ mkdir -p "$bin"
 export PATH="$bin:$HOME/.local/node/bin:$PATH"
 sudo=$([ "$(id -u)" = 0 ] || echo sudo)
 
+# Release downloads (GitHub's CDN especially) sometimes answer 504 for a minute; an installer's own
+# retries come in quick succession, so run the whole installer again after a pause.
+retry() {
+  for pause in 20 60 120; do
+    "$@" && return 0
+    echo "ci-install: '$*' failed; again in ${pause}s" >&2
+    sleep "$pause"
+  done
+  "$@"
+}
+
 $sudo apt-get update -qq
 $sudo apt-get install -y -qq --no-install-recommends tmux curl ca-certificates xz-utils >/dev/null
 
@@ -20,11 +31,11 @@ if ! node -e 'const [a, b] = process.versions.node.split(".").map(Number); proce
   curl -fsSL "https://nodejs.org/dist/latest-v24.x/$tarball" | tar -xJ --strip-components=1 -C "$HOME/.local/node"
 fi
 
-curl -fsSL https://herdr.dev/install.sh | sh                                   # herdr.dev/docs/install
-curl -fsSL https://claude.ai/install.sh | bash                                 # code.claude.com/docs/en/setup
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh   # github.com/openai/codex
-curl -fsSL https://omp.sh/install | sh -s -- --binary                          # github.com/can1357/oh-my-pi
-npm install -g --silent --prefix "$HOME/.local" @earendil-works/pi-coding-agent
+retry bash -o pipefail -c 'curl -fsSL https://herdr.dev/install.sh | sh'                                  # herdr.dev/docs/install
+retry bash -o pipefail -c 'curl -fsSL https://claude.ai/install.sh | bash'                                # code.claude.com/docs/en/setup
+retry bash -o pipefail -c 'curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh'  # github.com/openai/codex
+retry bash -o pipefail -c 'curl -fsSL https://omp.sh/install | sh -s -- --binary'                         # github.com/can1357/oh-my-pi
+retry npm install -g --silent --prefix "$HOME/.local" @earendil-works/pi-coding-agent
 
 if [ -n "${GITHUB_PATH:-}" ]; then
   echo "$bin" >>"$GITHUB_PATH"
