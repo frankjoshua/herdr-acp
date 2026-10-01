@@ -424,7 +424,8 @@ def run_pane(name: str, h: Herdr, url: str, root: Path, only: str | None, result
             fn(client, work, h, pane)
             rows.append((sname, True, f"{time.monotonic() - t:.1f}s"))
         except Failed as e:
-            rows.append((sname, False, f"{e}\n--- pane ---\n{h.screen(pane)}"))
+            log_tail = "".join((root / name / "herdr-acp.log").read_text(errors="replace").splitlines(True)[-25:])
+            rows.append((sname, False, f"{e}\n--- pane ---\n{h.screen(pane)}\n--- herdr-acp log (tail) ---\n{log_tail}"))
     client.close()
 
 
