@@ -31,5 +31,6 @@ jobs:
           if [ -z "$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[].number')" ]; then
             gh pr create --head "$BRANCH" --base main --title "$(gh api "repos/$GH_REPO/commits/$GITHUB_SHA" --jq '.commit.message | split("\n")[0]')" \
               --body "Opened by the auto-merge workflow for \`$BRANCH\`; merges itself once the required checks pass."
+          fi
       - name: Merge once the required checks pass
         run: gh pr merge "$BRANCH" --auto --squash  # the repo deletes merged branches

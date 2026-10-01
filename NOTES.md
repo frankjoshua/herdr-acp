@@ -3,6 +3,13 @@
 Design decisions and their reasons, dated. Buzz-specific notes live in the herdr-buzz repo.
 
 ## Decisions
+- **Everything reaches `main` by auto-merged PR** (2026-10-01). A ruleset on the default branch
+  requires a PR and green `agents` + `scan` checks, with no bypass, and the maintainer chose
+  that his own pushes wait too. `.github/workflows/automerge.yml` opens a PR for any pushed
+  branch, Dependabot's included, and turns on auto-merge (squash). Merged branches are deleted.
+  No manual step: push a branch, and it lands when green or stays open when red. Checks run on
+  the push and count by commit, so a PR opened by the workflow token doesn't need its own run.
+  Every Dependabot bump auto-merges, majors too; the live suite is the gate.
 - **CI runs the live suite daily on the latest Herdr and agents** (2026-09-30).
   `.github/workflows/agents.yml` runs on push, pull requests, a daily schedule and manual
   dispatch, with `contents: read`, SHA-pinned actions and no secrets.

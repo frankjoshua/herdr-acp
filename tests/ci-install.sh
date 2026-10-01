@@ -9,15 +9,16 @@ mkdir -p "$bin"
 export PATH="$bin:$HOME/.local/node/bin:$PATH"
 sudo=$([ "$(id -u)" = 0 ] || echo sudo)
 
-# Release downloads (GitHub's CDN especially) sometimes answer 504 for a minute; an installer's own
-# retries come in quick succession, so run the whole installer again after a pause.
+# Release downloads (GitHub's CDN especially) sometimes answer 504 for a minute, or stall with no
+# answer at all; an installer's own retries come in quick succession and its curl has no time
+# limit. So each attempt gets 5 minutes, and the whole installer runs again after a pause.
 retry() {
   for pause in 20 60 120; do
-    "$@" && return 0
-    echo "ci-install: '$*' failed; again in ${pause}s" >&2
+    timeout 300 "$@" && return 0
+    echo "ci-install: '$*' failed or stalled; again in ${pause}s" >&2
     sleep "$pause"
   done
-  "$@"
+  timeout 300 "$@"
 }
 
 $sudo apt-get update -qq
