@@ -3,6 +3,42 @@
 Design decisions and their reasons, dated. Buzz-specific notes live in the herdr-buzz repo.
 
 ## Decisions
+- **A live suite runs the installed agents against a fake provider** (2026-09-30).
+  `tests/agents.py` gives each of Claude Code, Codex and OMP (and a bare shell) a pane on a
+  private, headless Herdr server (`herdr --session hacp-agents-<pid> server`). Each agent gets its
+  own HOME and config dir, so no login, no MCP servers, no skills and no user config leak in.
+  herdr-acp drives each pane over ACP. `tests/fakellm.py` speaks the Anthropic Messages and
+  OpenAI Responses APIs: `HACP-SAY` / `HACP-RUN` markers script the answers. It reads tool names
+  and argument schemas from each request, so an agent update that renames a tool or changes its
+  schema doesn't break it.
+  - Setup per agent:
+    - *Claude*: `CLAUDE_CONFIG_DIR` with a `.claude.json` that has onboarding done, the fake key
+      approved and the work dir trusted, plus `ANTHROPIC_BASE_URL`.
+    - *Codex*: `CODEX_HOME` with `config.toml` that sets a custom `model_provider` with
+      `wire_api = "responses"`, the work dir trusted and the update check off.
+    - *OMP*: `PI_CODING_AGENT_DIR` with a `models.yml` custom `anthropic-messages` provider and
+      `config.yml` set to `setupVersion: 2`, which skips the login wizard.
+  - Runs take ~17s, all agents in parallel. A failure prints the screen and keeps the logs.
+  - The suite found these, now handled:
+    - *OMP doesn't hold its session file open during the first turn*, so rediscovery must be the
+      full one (open files, then the cwd-scoped search, ~2ms), not open files alone.
+    - *Claude and Codex drop a key that arrives as their dialog is drawn.* Claude ignored Enter
+      sent at 0s in 2 of 3 tries, never from 0.1s. Nothing tells when a dialog starts listening.
+      So a key the agent hasn't acted on within `KEY_TAKEN` (1s) is pressed again, up to 3
+      times. It is pressed only while that same dialog is still on screen and the agent shows no
+      answer, checked by reading the screen and then the transcript. That is the one herdr-acp
+      bound that leads to an action; it recovers a lost key and never decides success. An
+      auto-approving client hits this in real use: it answers the moment the dialog shows.
+    - *A dialog counts as answered only on a tool result, a turn end, or Herdr seeing the agent
+      leave `blocked`*: Claude writes the dialog's own tool call (and text) just after the
+      dialog shows, so "the transcript moved" was not proof.
+    - *Esc on OMP's approval denies the tool and OMP goes on*: a dismissal sends a second Esc if
+      the turn hasn't ended, so the turn stops as ACP `cancelled` requires.
+    - *Herdr's status lags the screen both ways*: it stayed `blocked` after a dialog closed, and
+      it accepted a prompt while a dialog was still up. herdr-acp now refuses a prompt itself
+      (`invalid_request`) when the screen shows a dialog, instead of typing into it.
+    - *Claude merges the next prompt into the rejected tool's result message*; the fake answers
+      whichever of the two comes last.
 - **No decision waits out a delay** (2026-09-30). Every turn end, dialog and reader swap follows
   a signal; `POLL` (0.5s) only paces reading the transcript or screen.
   - *Transport is Herdr's socket API* (`herdr api schema --json`), not the CLI: the CLI has no
@@ -25,12 +61,11 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
     shell pid), the screen changed since the command was typed, and the bottom row isn't the
     typed command (the moment between echo and fork). Herdr emits no event for a shell.
   - *Dialogs*: during a turn, `pane.wait_for_output` (Herdr-side) waits for a dialog-looking row
-    (`DIALOG_HINT`); `parse_dialog` decides. A dialog is over once the transcript moves or Herdr
-    reports the agent leaving `blocked`. That rule replaces the 3s "answered" window and keeps
-    an identical next dialog (OMP's `Allow tool: bash`) from looking like the old one. A late
+    (`DIALOG_HINT`); `parse_dialog` decides. A dialog is over once the agent shows it was answered
+    (see the live-suite entry above). That replaces the 3s "answered" window and keeps an
+    identical next dialog (OMP's `Allow tool: bash`) from looking like the old one. A late
     `blocked` event doesn't count. The choice is typed as Up/Down, and Enter is pressed only once
-    `wait_for_output` sees the cursor on that option's row (`cursor_on`). If it never does
-    within 5s, nothing is pressed.
+    `wait_for_output` sees the cursor on that option's row (`cursor_on`).
   - *Reader swap*: Herdr's `pane.agent_detected` / `pane.agent_status_changed` events flag a
     re-pick. The tail does it on its next pass, retrying while the new agent hasn't written its
     session file yet. This replaces the 5s process re-check, and was verified live with Claude
