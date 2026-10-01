@@ -1,0 +1,36 @@
+name: Auto-merge
+# Any branch pushed to this repo (yours or Dependabot's) gets a PR into main with auto-merge on.
+# The merge itself waits for the checks main requires (agents, scan) to pass on the branch's commit;
+# a red check leaves the PR open. Pull requests from forks are left alone.
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+permissions:
+  contents: read
+jobs:
+  automerge:
+    if: >-
+      github.event_name == 'push' && !github.event.deleted ||
+      github.event_name == 'pull_request' && !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
+    steps:
+      - name: Open a PR for a pushed branch
+        if: github.event_name == 'push'
+        run: |
+          if [ -z "$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[].number')" ]; then
+            gh pr create --head "$BRANCH" --base main --title "$(gh api "repos/$GH_REPO/commits/$GITHUB_SHA" --jq '.commit.message | split("\n")[0]')" \
+              --body "Opened by the auto-merge workflow for \`$BRANCH\`; merges itself once the required checks pass."
+      - name: Merge once the required checks pass
+        run: gh pr merge "$BRANCH" --auto --squash  # the repo deletes merged branches
+        run: gh pr merge "$BRANCH" --auto --squash --delete-branch
