@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import queue
+import shlex
 import shutil
 import subprocess
 import sys
@@ -187,7 +188,7 @@ def setup_claude(root: Path, url: str) -> tuple[dict, list]:
 
 def setup_codex(root: Path, url: str) -> tuple[dict, list]:
     (root / "codex").mkdir()
-    (root / "codex" / "config.toml").write_text(f"""model = "gpt-5.5"
+    (root / "codex" / "config.toml").write_text(f"""model = "hacp-fake"
 model_provider = "hacp"
 check_for_update_on_startup = false
 
@@ -223,14 +224,46 @@ def setup_omp(root: Path, url: str) -> tuple[dict, list]:
     return {"PI_CODING_AGENT_DIR": str(root / "omp")}, ["--model", "hacp/hacp-fake", "--approval-mode", "always-ask"]
 
 
-AGENTS = {"claude": setup_claude, "codex": setup_codex, "omp": setup_omp}
+def setup_pi(root: Path, url: str) -> tuple[dict, list]:
+    (root / "pi").mkdir()
+    (root / "pi" / "models.json").write_text(json.dumps({"providers": {"hacp": {
+        "baseUrl": url, "api": "anthropic-messages", "apiKey": "hacp-fake-key",
+        "models": [{"id": "hacp-fake", "name": "HACP fake", "reasoning": False, "input": ["text"],
+                    "contextWindow": 200000, "maxTokens": 8192}]}}}))
+    return {"PI_CODING_AGENT_DIR": str(root / "pi"), "PI_OFFLINE": "1"}, ["--model", "hacp/hacp-fake"]
 
 
-def version(agent: str) -> str:
-    try:
-        return subprocess.run([agent, "--version"], capture_output=True, text=True, timeout=30).stdout.strip().splitlines()[0]
-    except (OSError, IndexError, subprocess.TimeoutExpired):
-        return "?"
+TMUX = f"hacp-agents-{os.getpid()}"  # the private tmux server codex-tmux runs in
+
+# What runs in each pane. `bin`: the agent binary (skipped when not on PATH). `approvals`: it asks
+# before running a tool (Pi never does). `tmux`: started inside a tmux client, the way the Codex
+# desktop harness runs it, so herdr-acp has to see through tmux. `slash`: a built-in command that
+# starts no turn.
+PANES = {
+    "claude": {"setup": setup_claude, "bin": "claude", "slash": "/cost"},
+    "codex": {"setup": setup_codex, "bin": "codex", "slash": "/status"},
+    "omp": {"setup": setup_omp, "bin": "omp", "slash": "/session"},
+    "pi": {"setup": setup_pi, "bin": "pi", "approvals": False, "slash": "/session"},
+    "codex-tmux": {"setup": setup_codex, "bin": "codex", "tmux": True},
+    "shell": {},
+}
+
+
+def available(name: str) -> bool:
+    p = PANES[name]
+    return all(shutil.which(b) for b in [p.get("bin")] + (["tmux"] if p.get("tmux") else []) if b)
+
+
+def version(name: str) -> str:
+    def run(*argv):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=30).stdout.strip().splitlines()[0]
+        except (OSError, IndexError, subprocess.TimeoutExpired):
+            return "?"
+    p = PANES[name]
+    if not p:
+        return "bash"
+    return run(p["bin"], "--version") + (f" in {run('tmux', '-V')}" if p.get("tmux") else "")
 
 
 # ---- scenarios -------------------------------------------------------------------------------
@@ -282,11 +315,38 @@ def human(c, work, h, pane):
     check(any("typed at the pane" in t for t in said(ups, "user_message_chunk")), f"human input not streamed: {ups}")
 
 
-def slash(c, work, h, pane):
-    """A built-in command starts no turn and writes nothing: it ends on Herdr's stall verdict."""
-    stop, _, secs = c.prompt("/cost")
-    check(stop == "end_turn", f"stop reason {stop}")
-    h.cli("pane", "send-keys", pane, "esc")  # close the panel for whatever runs next
+def slash(command: str):
+    def scenario(c, work, h, pane):
+        """A built-in command starts no turn and writes nothing: it ends on Herdr's stall verdict
+        (or, for an agent Herdr doesn't track, the transcript staying silent)."""
+        stop, _, _ = c.prompt(command)
+        check(stop == "end_turn", f"stop reason {stop}")
+    return scenario
+
+
+def slow(c, work, h, pane):
+    """A slow model: nothing for 3s, then the reply word by word. The turn holds until the reply."""
+    stop, ups, secs = c.prompt("HACP-SLOW 3 slow words arrive late")
+    check(stop == "end_turn" and secs >= 3, f"stop {stop} after {secs:.1f}s")
+    check("slow words arrive late" in said(ups), f"reply not streamed: {said(ups)}")
+
+
+def slow_tool(answer):
+    """A tool that runs 3 silent seconds (asked about first, if the agent asks): the turn holds."""
+    def scenario(c, work, h, pane):
+        target = work / "slow-tool.txt"
+        stop, ups, secs = c.prompt(f"HACP-RUN sleep 3 && touch {target}", answer)
+        check(stop == "end_turn" and secs >= 3, f"stop {stop} after {secs:.1f}s")
+        check(target.exists() and "HACP-RAN" in said(ups), f"tool didn't finish: {said(ups)}")
+    return scenario
+
+
+def run_unasked(c, work, h, pane):
+    """An agent without approvals (Pi) runs the tool straight away; nothing is asked."""
+    target = work / "unasked.txt"
+    stop, ups, _ = c.prompt(f"HACP-RUN touch {target}")
+    check(stop == "end_turn" and not c.asked, f"stop {stop}, asked {c.asked}")
+    check(target.exists() and "HACP-RAN" in said(ups), f"tool didn't run: {said(ups)}")
 
 
 def shell_echo(c, work, h, pane):
@@ -304,12 +364,25 @@ def shell_builtin(c, work, h, pane):
     check(stop == "end_turn", f"stop {stop}")
 
 
-AGENT_SCENARIOS = [("say", say), ("allow", run_and("allow_once", True, "end_turn")),
-                   ("reject", run_and("reject_once", False, "end_turn")),
-                   ("dismiss", run_and("cancelled", False, "cancelled")), ("after-cancel", still_here),
-                   ("human", human)]
-EXTRA = {"claude": [("slash", slash)]}
 SHELL_SCENARIOS = [("echo", shell_echo), ("silent", shell_silent), ("builtin", shell_builtin)]
+
+
+def scenarios(name: str) -> list:
+    p = PANES[name]
+    if not p:
+        return SHELL_SCENARIOS
+    out = [("say", say), ("slow", slow)]
+    if p.get("approvals", True):
+        out += [("allow", run_and("allow_once", True, "end_turn")), ("slow-tool", slow_tool(pick("allow_once"))),
+                ("reject", run_and("reject_once", False, "end_turn")),
+                ("dismiss", run_and("cancelled", False, "cancelled")), ("after-cancel", still_here)]
+    else:
+        out += [("run", run_unasked), ("slow-tool", slow_tool(None))]
+    if not p.get("tmux"):  # Herdr types for the "human"; it doesn't see an agent behind a tmux client
+        out.append(("human", human))
+    if p.get("slash"):
+        out.append(("slash", slash(p["slash"])))
+    return out
 
 
 # ---- runner ----------------------------------------------------------------------------------
@@ -319,20 +392,25 @@ def run_pane(name: str, h: Herdr, url: str, root: Path, only: str | None, result
     work, home = root / name / "work", root / name / "home"
     work.mkdir(parents=True)
     home.mkdir()
-    env, args = AGENTS[name](root / name, url) if name in AGENTS else ({}, [])
+    p = PANES[name]
+    env, args = p["setup"](root / name, url) if p else ({}, [])
     env = {"HOME": str(home), **env}
     flags = [x for k, v in env.items() for x in ("--env", f"{k}={v}")]
     pane = None
     try:
         pane = h.cli("workspace", "create", "--cwd", str(work), "--label", name, "--no-focus", *flags)["root_pane"]["pane_id"]
-        if name in AGENTS:
-            h.cli("agent", "start", f"t{name}", "--kind", name, "--pane", pane, "--", *args)
+        if p.get("tmux"):
+            agent = shlex.join([p["bin"], *args])
+            h.cli("pane", "run", pane, shlex.join(["tmux", "-L", TMUX, "-f", "/dev/null", "new-session", "-s", name, agent]))
+            h.cli("pane", "wait-output", pane, "--source", "visible", "--match", "Ask Codex", "--timeout", "60000")
+        elif p:
+            h.cli("agent", "start", f"t{name}", "--kind", p["bin"], "--pane", pane, "--", *args)
         client = Client(h, pane, root / name / "herdr-acp.log")
+        results[name + ":herdr"] = h.cli("pane", "get", pane)["pane"].get("agent") or "none"
     except Failed as e:
         rows.append(("start", False, f"{e}\n{h.screen(pane) if pane else ''}"))
         return
-    scenarios = (SHELL_SCENARIOS if name == "shell" else AGENT_SCENARIOS + EXTRA.get(name, []))
-    for sname, fn in scenarios:
+    for sname, fn in scenarios(name):
         if only and sname != only:
             continue
         t = time.monotonic()
@@ -346,11 +424,11 @@ def run_pane(name: str, h: Herdr, url: str, root: Path, only: str | None, result
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("panes", nargs="*", default=["claude", "codex", "omp", "shell"])
+    ap.add_argument("panes", nargs="*", default=list(PANES))
     ap.add_argument("-k", dest="only", help="run only this scenario")
     ap.add_argument("-v", action="store_true", help="print the fake provider's request log")
     a = ap.parse_args()
-    panes = [p for p in a.panes if p == "shell" or shutil.which(p)]
+    panes = [p for p in a.panes if available(p)]
     skipped = [p for p in a.panes if p not in panes]
     root = Path(tempfile.mkdtemp(prefix="hacp-agents-"))
     log = open(root / "fakellm.log", "w")
@@ -366,11 +444,13 @@ def main() -> int:
             th.join()
     finally:
         h.stop()
+        if shutil.which("tmux"):
+            subprocess.run(["tmux", "-L", TMUX, "kill-server"], capture_output=True)
         server.shutdown()
         log.close()
-    ok = all(passed for rows in results.values() for _, passed, _ in rows)
+    ok = all(passed for k, rows in results.items() if not k.endswith(":herdr") for _, passed, _ in rows)
     for p in panes:
-        print(f"\n{p}: {version(p) if p in AGENTS else 'bash'}")
+        print(f"\n{p}: {version(p)} (Herdr detects: {results.get(p + ':herdr', '?')})")
         for sname, passed, note in results.get(p, []):
             print(f"  {'PASS' if passed else 'FAIL'} {sname:<13} {note if passed else ''}")
             if not passed:

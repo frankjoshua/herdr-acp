@@ -36,8 +36,10 @@ call and record it in `NOTES.md` (decisions and their reasons, dated).
 
 Self-checks: `python -m herdr_acp.reader`, `python -m herdr_acp.main --selfcheck`,
 `python tests/fakellm.py --selfcheck`, `python -m herdr_acp.transport <pane>`. Live:
-`.venv/bin/python tests/agents.py` (installed Claude/Codex/OMP + a shell on a private Herdr server
-against a fake provider; ~20s, no logins). Run it after any change to reading dialogs, turn ends
-or input, and after agent updates. Ad hoc: `python tests/roundtrip.py <pane> "<prompt>"`.
+`.venv/bin/python tests/agents.py` (installed Claude/Codex/OMP/Pi, Codex in tmux, and a shell, on a
+private Herdr server against a fake provider; ~30s, no logins). Run it after any change to reading
+dialogs, turn ends or input, and after agent updates. CI (`.github/workflows/agents.yml`, installs
+via `tests/ci-install.sh`) runs it daily on the latest Herdr and agents. Ad hoc:
+`python tests/roundtrip.py <pane> "<prompt>"`.
 Test in a Herdr Space and pane of your own (`herdr workspace create`, `herdr agent start`), never
 in someone's working pane. Commit small, on `main`.

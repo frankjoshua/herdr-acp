@@ -1,19 +1,20 @@
-"""A fake model provider for the agent tests: real Claude Code, Codex and OMP binaries talk to it
-instead of Anthropic/OpenAI, so no login and no tokens are needed.
+"""A fake model provider for the agent tests: real Claude Code, Codex, OMP and Pi binaries talk
+to it instead of Anthropic/OpenAI, so no login and no tokens are needed.
 
-Speaks the Anthropic Messages API (`POST /v1/messages`, Claude Code and OMP) and the OpenAI
-Responses API (`POST /v1/responses`, Codex), streaming. What it answers is scripted by a marker
+Speaks the Anthropic Messages API (`POST /v1/messages`: Claude Code, OMP, Pi) and the OpenAI
+Responses API (`POST /v1/responses`: Codex), streaming. What it answers is scripted by a marker
 in the latest user message:
 
-  HACP-SAY <text>   reply with <text>
-  HACP-RUN <cmd>    call the agent's shell tool with <cmd>; once the tool result comes back,
-                    reply "HACP-RAN"
+  HACP-SAY <text>          reply with <text>
+  HACP-RUN <cmd>           call the agent's shell tool with <cmd>; once the tool result comes
+                           back, reply "HACP-RAN"
+  HACP-SLOW <secs> <text>  a slow model: nothing for <secs>, then <text> word by word
 
 Anything else (title generation, quota probes, advisors) gets a short plain reply. The shell
 tool and its argument names are read from the request's tool list, so a renamed tool or a new
 schema in a daily agent update doesn't need a change here.
 
-Run standalone to watch requests: `python tests/fakellm.py [port]` (logs to stderr).
+Run standalone to watch requests: `python tests/fakellm.py [port] [dump dir]` (logs to stderr).
 """
 
 import itertools
@@ -21,9 +22,10 @@ import json
 import re
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-MARKER = re.compile(r"HACP-(SAY|RUN) (.+?)(?:\s*$|\n)", re.S)
+MARKER = re.compile(r"HACP-(SAY|RUN|SLOW) (.+?)(?:\s*$|\n)", re.S)
 SHELL_TOOLS = ("bash", "shell", "exec_command", "shell_command")  # compared without case or leading "_" (OMP: "_bash")
 ids = itertools.count(1)
 
@@ -68,7 +70,8 @@ def _shell_tool(tools: list) -> tuple[str, dict] | None:
 
 
 def plan(user_texts: list[str], after_tool_result: bool, tools: list):
-    """('text', str) or ('tool', name, args): the scripted answer to one request."""
+    """('text', str[, seconds]) or ('tool', name, args): the scripted answer to one request.
+    `seconds`: wait that long before answering, then stream word by word (a slow model)."""
     if after_tool_result:
         return ("text", "HACP-RAN")
     found = _marker(user_texts)
@@ -77,7 +80,18 @@ def plan(user_texts: list[str], after_tool_result: bool, tools: list):
         return ("tool", shell[0], _shell_args(shell[1], found[1]))
     if found and found[0] == "SAY":
         return ("text", found[1])
+    if found and found[0] == "SLOW":
+        secs, _, text = found[1].partition(" ")
+        return ("text", text, float(secs)) if shell else ("text", text)  # side requests (titles) stay fast
     return ("text", "ok")
+
+
+def _pieces(p) -> list[str]:
+    """The text deltas: word by word for a slow answer, else in one piece."""
+    if len(p) < 3:
+        return [p[1]]
+    words = p[1].split(" ")
+    return [w if i == 0 else " " + w for i, w in enumerate(words)]
 
 
 # ---- Anthropic Messages ----------------------------------------------------------------------
@@ -102,9 +116,10 @@ def anthropic_sse(body: dict, p) -> list[bytes]:
         "content": [], "stop_reason": None, "stop_sequence": None,
         "usage": {"input_tokens": 10, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}})]
     if p[0] == "text":
-        out += [("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
-                ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": p[1]}}),
-                ("content_block_stop", {"type": "content_block_stop", "index": 0})]
+        out += [("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})]
+        out += [("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}})
+                for t in _pieces(p)]
+        out += [("content_block_stop", {"type": "content_block_stop", "index": 0})]
         stop = "end_turn"
     else:
         out += [("content_block_start", {"type": "content_block_start", "index": 0,
@@ -149,11 +164,12 @@ def responses_sse(body: dict, p) -> list[bytes]:
                 "content": [{"type": "output_text", "text": p[1], "annotations": []}]}
         events = [("response.output_item.added", {"output_index": 0, "item": {**item, "status": "in_progress", "content": []}}),
                   ("response.content_part.added", {"item_id": item["id"], "output_index": 0, "content_index": 0,
-                                                   "part": {"type": "output_text", "text": "", "annotations": []}}),
-                  ("response.output_text.delta", {"item_id": item["id"], "output_index": 0, "content_index": 0, "delta": p[1]}),
-                  ("response.output_text.done", {"item_id": item["id"], "output_index": 0, "content_index": 0, "text": p[1]}),
-                  ("response.content_part.done", {"item_id": item["id"], "output_index": 0, "content_index": 0,
-                                                  "part": item["content"][0]})]
+                                                   "part": {"type": "output_text", "text": "", "annotations": []}})]
+        events += [("response.output_text.delta", {"item_id": item["id"], "output_index": 0, "content_index": 0, "delta": t})
+                   for t in _pieces(p)]
+        events += [("response.output_text.done", {"item_id": item["id"], "output_index": 0, "content_index": 0, "text": p[1]}),
+                   ("response.content_part.done", {"item_id": item["id"], "output_index": 0, "content_index": 0,
+                                                   "part": item["content"][0]})]
     else:
         item = {"id": f"fc_{n}", "type": "function_call", "status": "completed", "call_id": f"call_hacp{n}",
                 "name": p[1], "arguments": json.dumps(p[2])}
@@ -188,7 +204,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _stream(self, chunks: list[bytes]) -> None:
+    def _stream(self, chunks: list[bytes], slow: float = 0.0) -> None:
+        """`slow`: seconds before the first byte, then chunks 0.1s apart (a slow model)."""
+        time.sleep(slow)
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
@@ -196,6 +214,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         for c in chunks:
             self.wfile.write(c)
+            if slow:
+                self.wfile.flush()
+                time.sleep(0.1)
         self.wfile.flush()
         self.close_connection = True
 
@@ -230,7 +251,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.log:
             print(f"POST {path} tools={len(body.get('tools') or [])} -> {p[0]} {p[1]}", file=self.log, flush=True)
         if body.get("stream") or make is None:
-            return self._stream(stream(body, p))
+            return self._stream(stream(body, p), p[2] if p[0] == "text" and len(p) > 2 else 0.0)
         return self._reply(200, make(body, p))
 
 
@@ -266,6 +287,10 @@ def _selfcheck() -> None:
                            "tools": codex}) == ("tool", "exec_command", {"cmd": "ls", "sandbox_permissions": "require_escalated",
                                                                           "justification": "hacp test needs to write a file"})
     assert responses_plan({"input": [{"type": "function_call_output", "call_id": "c", "output": "x"}], "tools": codex}) == ("text", "HACP-RAN")
+    # a slow model, for the agent's own request only; a side request (no shell tool) stays fast
+    assert plan(["HACP-SLOW 2 one two"], False, omp) == ("text", "one two", 2.0)
+    assert plan(["HACP-SLOW 2 one two"], False, []) == ("text", "one two")
+    assert _pieces(("text", "one two", 2.0)) == ["one", " two"] and _pieces(("text", "one two")) == ["one two"]
     print("fakellm ok")
 
 

@@ -45,13 +45,20 @@ Self-checks (no Herdr needed): `python -m herdr_acp.reader`, `python -m herdr_ac
 `python tests/fakellm.py --selfcheck`. Against a pane: `python -m herdr_acp.transport <pane>`,
 `python tests/roundtrip.py <pane> "pwd" [allow_once]`.
 
-Live suite: `.venv/bin/python tests/agents.py [claude codex omp shell] [-k scenario]`. It runs
-the installed Claude Code, Codex and OMP (and a bare shell) on a private Herdr server, against a
-fake model provider (`tests/fakellm.py`). That needs no login and no tokens, and leaves your
-agent configs alone. Each agent gets the same scenarios: a reply, an approval allowed, rejected
-and dismissed, a turn after the dismissal, and input typed at the pane; Claude also gets a
-slash command. The shell gets an echo, a silent command and a builtin. It takes about 20s. Run
-it after the agents update.
+Live suite: `.venv/bin/python tests/agents.py [claude codex omp pi codex-tmux shell] [-k scenario]`.
+It runs the installed Claude Code, Codex, OMP and Pi, Codex inside a tmux client, and a bare shell,
+each on a private Herdr server, against a fake model provider (`tests/fakellm.py`). That needs no
+login and no tokens, and leaves your agent configs alone. Scenarios:
+
+- Every agent: a reply, a slow model (3s before the first word), and input typed at the pane.
+- Agents that ask before running tools: an approval allowed, rejected and dismissed; a slow tool;
+  a turn after the dismissal.
+- Pi, which never asks: a tool that runs unasked.
+- Built-in slash commands, per agent.
+- The shell: an echo, a silent command and a builtin.
+
+It takes about 30s. CI runs it daily on the latest agents and Herdr
+(`.github/workflows/agents.yml`).
 
 Clients: the Buzz bridge (identity minting, buzz-acp launcher, Herdr plugin) is
 [herdr-buzz](https://github.com/frankjoshua/herdr-buzz).

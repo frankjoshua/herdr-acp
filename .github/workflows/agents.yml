@@ -1,0 +1,36 @@
+name: Live agents
+# tests/agents.py against the latest Herdr, Claude Code, Codex, OMP and Pi, each driven by the
+# local fake provider (no logins, no secrets). Daily, because the agents update daily.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  agents:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: tests/ci-install.sh
+      - name: Self-checks
+        run: |
+          python -m herdr_acp.reader
+          python -m herdr_acp.main --selfcheck
+          python tests/fakellm.py --selfcheck
+      - run: python tests/agents.py -v
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hacp-agents
+          path: /tmp/hacp-agents-*
+          retention-days: 7

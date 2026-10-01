@@ -3,12 +3,34 @@
 Design decisions and their reasons, dated. Buzz-specific notes live in the herdr-buzz repo.
 
 ## Decisions
+- **CI runs the live suite daily on the latest Herdr and agents** (2026-09-30).
+  `.github/workflows/agents.yml` runs on push, pull requests, a daily schedule and manual
+  dispatch, with `contents: read`, SHA-pinned actions and no secrets.
+  - `tests/ci-install.sh` installs each tool with its official installer:
+    - Herdr: `herdr.dev/install.sh`;
+    - Claude: `claude.ai/install.sh`;
+    - Codex: `chatgpt.com/codex/install.sh`;
+    - OMP: `omp.sh/install --binary`;
+    - Pi: npm, which needs Node ≥ 22.19, so the script fetches Node 24 when the runner's is older.
+  - It then runs the self-checks and `tests/agents.py -v`, and uploads the work directories when
+    something fails.
+  - Versions are deliberately not pinned: the point is to learn the day an update breaks herdr-acp.
+  - A clean `ubuntu:24.04` container run of the same steps passed every pane (herdr 0.9.3,
+    claude 2.1.286, codex 0.159.3, omp 18.4.6, pi 0.99.2).
+  - That container run found that Codex 0.159 shows a "try the new model" prompt at startup for
+    catalog models that have an upgrade. The suite now names its model `hacp-fake`, which Codex
+    doesn't know and so never migrates; that is version-proof where pinning a mapping is not.
+  - Codex inside tmux sometimes swallowed the Enter typed with its prompt (1 run in 5). For an
+    agent Herdr can't see, herdr-acp now checks the transcript records the prompt and presses
+    Enter again if not (`_type`, same bound as dialog keys).
+  - Herdr's unblock count now needs an actual change from `blocked`: a stale `working` that
+    arrived after a dialog showed made a lost key look taken.
 - **A live suite runs the installed agents against a fake provider** (2026-09-30).
-  `tests/agents.py` gives each of Claude Code, Codex and OMP (and a bare shell) a pane on a
-  private, headless Herdr server (`herdr --session hacp-agents-<pid> server`). Each agent gets its
+  `tests/agents.py` gives each of Claude Code, Codex, OMP, Pi, Codex inside a tmux client, and a
+  bare shell a pane on a private, headless Herdr server (`herdr --session hacp-agents-<pid> server`). Each agent gets its
   own HOME and config dir, so no login, no MCP servers, no skills and no user config leak in.
   herdr-acp drives each pane over ACP. `tests/fakellm.py` speaks the Anthropic Messages and
-  OpenAI Responses APIs: `HACP-SAY` / `HACP-RUN` markers script the answers. It reads tool names
+  OpenAI Responses APIs: `HACP-SAY` / `HACP-RUN` / `HACP-SLOW` markers script the answers. It reads tool names
   and argument schemas from each request, so an agent update that renames a tool or changes its
   schema doesn't break it.
   - Setup per agent:
@@ -18,7 +40,15 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
       `wire_api = "responses"`, the work dir trusted and the update check off.
     - *OMP*: `PI_CODING_AGENT_DIR` with a `models.yml` custom `anthropic-messages` provider and
       `config.yml` set to `setupVersion: 2`, which skips the login wizard.
-  - Runs take ~17s, all agents in parallel. A failure prints the screen and keeps the logs.
+    - *Pi*: `PI_CODING_AGENT_DIR` with a `models.json` custom `anthropic-messages` provider, and
+      `PI_OFFLINE=1`. Pi has no approval dialogs, so it runs a tool unasked.
+    - *codex-tmux*: the pane runs `tmux -L <private> new-session codex …`. Herdr detects no agent
+      there, so herdr-acp's own path is exercised: it resolves the tmux client to Codex,
+      types with `send_input`, and reads dialogs through tmux's screen.
+  - A slow model (`HACP-SLOW`: 3s to the first word, then 0.1s per word) and a 3s silent tool both
+    hold the turn. Slash commands (`/cost`, `/status`, `/session`) end on Herdr's stall verdict.
+  - Runs take ~30s, all panes in parallel. A failure prints the screen and keeps the logs. The
+    report shows each agent's version and what Herdr detects in its pane.
   - The suite found these, now handled:
     - *OMP doesn't hold its session file open during the first turn*, so rediscovery must be the
       full one (open files, then the cwd-scoped search, ~2ms), not open files alone.
@@ -32,8 +62,12 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
     - *A dialog counts as answered only on a tool result, a turn end, or Herdr seeing the agent
       leave `blocked`*: Claude writes the dialog's own tool call (and text) just after the
       dialog shows, so "the transcript moved" was not proof.
-    - *Esc on OMP's approval denies the tool and OMP goes on*: a dismissal sends a second Esc if
-      the turn hasn't ended, so the turn stops as ACP `cancelled` requires.
+    - *Esc on OMP's approval denies the tool and OMP goes on*: a dismissal sends a second Esc to
+      OMP only, if its turn hasn't ended, so the turn stops as ACP `cancelled` requires. This is
+      decided by agent kind, not marker timing: on Claude, Herdr's unblock can come before the
+      turn-end marker, and a second Esc there opens the rewind menu.
+    - A prompt refused because a dialog is open isn't recorded as sent, so identical words a
+      human types later still stream as theirs.
     - *Herdr's status lags the screen both ways*: it stayed `blocked` after a dialog closed, and
       it accepted a prompt while a dialog was still up. herdr-acp now refuses a prompt itself
       (`invalid_request`) when the screen shows a dialog, instead of typing into it.
