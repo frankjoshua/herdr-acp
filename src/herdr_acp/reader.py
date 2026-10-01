@@ -5,8 +5,8 @@ CodexRollout tails <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl the same way
 PiSession tails a Pi-format session (Pi, OMP): <agent dir>/sessions/<cwd>/<ts>_<id>.jsonl.
 ScreenDiff diffs successive plain-text screen snapshots (floor for shells / unknown agents).
 `parse_dialog(screen)` finds an approval/question dialog waiting at the bottom of the pane.
-All expose `async poll() -> list[update]`. The transcript readers also put TURN_END where the
-agent recorded the end of a turn. `claude_transcript_for(pid)` / `codex_rollout_for(pid)` /
+All expose `async poll() -> list[update]`. The transcript readers also put a `Mark` after each user
+message and at each turn end the agent recorded. `claude_transcript_for(pid)` / `codex_rollout_for(pid)` /
 `pi_session_for(pid, kind)` find the file from the agent process itself (`proc_info`).
 """
 
@@ -31,7 +31,22 @@ from acp import (
 log = logging.getLogger("herdr-acp")
 PROC = "/proc"  # discovery is process-first (env, cwd, open files); the only glob is the cwd-scoped
 # fallback for an agent that has not opened its session file yet.
-TURN_END = "turn_end"  # in a reader's updates: the agent recorded the end of a turn here
+
+
+class Mark(NamedTuple):
+    """In a reader's updates: the agent recorded a user message ("user") or the end of a turn
+    ("end"), at the entry's ISO timestamp ("" if it had none). Agents can write a turn's lines out
+    of order under load (Claude wrote its reply and turn end before the user message), so which
+    turn an end belongs to is decided by time, not by where it sits in the file."""
+    kind: str
+    at: str
+
+
+TURN_END = Mark("end", "")
+
+
+def _user(text: str, entry: dict) -> list:
+    return [update_user_message_text(text), Mark("user", entry.get("timestamp") or "")]
 
 TOOL_KIND = {
     "Bash": "execute", "Read": "read", "Edit": "edit", "Write": "edit", "NotebookEdit": "edit",
@@ -94,12 +109,12 @@ def updates_from_entry(entry: dict) -> list:
         return []  # ponytail: subagent traffic skipped; surface as nested tool_call later if wanted
     kind = entry.get("type")
     if kind == "system" and entry.get("subtype") == "turn_duration":  # Claude closes every turn with it
-        return [TURN_END]
+        return [Mark("end", entry.get("timestamp") or "")]
     content = (entry.get("message") or {}).get("content")
     if kind == "user" and isinstance(content, str):  # a human typed in the pane
         text = content.strip()
         # skip slash-command wrappers (<command-name>…) and interruption markers
-        return [update_user_message_text(text)] if text and not text.startswith(("<", "[Request interrupted")) else []
+        return _user(text, entry) if text and not text.startswith(("<", "[Request interrupted")) else []
     if kind not in ("user", "assistant") or not isinstance(content, list):
         return []
     out = []
@@ -192,14 +207,14 @@ def codex_updates(entry: dict) -> list:
     """Map one rollout line to ACP updates (only `item_completed` events carry anything)."""
     p = entry.get("payload") or {}
     if entry.get("type") == "event_msg" and p.get("type") in ("task_complete", "turn_aborted"):
-        return [TURN_END]
+        return [Mark("end", entry.get("timestamp") or "")]
     if entry.get("type") != "event_msg" or p.get("type") != "item_completed":
         return []
     it = p.get("item") or {}
     kind, iid = it.get("type"), it.get("id", "")
     if kind == "UserMessage":
         text = _item_text(it.get("content")).strip()
-        return [update_user_message_text(text)] if text else []
+        return _user(text, entry) if text else []
     if kind == "AgentMessage":
         text = _item_text(it.get("content"))
         return [update_agent_message_text(text)] if text.strip() else []
@@ -304,7 +319,7 @@ def pi_updates(entry: dict) -> list:
     role, content = m.get("role"), m.get("content")
     if role == "user":
         text = content if isinstance(content, str) else "".join(b.get("text", "") for b in content or [] if b.get("type") == "text")
-        return [update_user_message_text(text.strip())] if text.strip() else []
+        return _user(text.strip(), entry) if text.strip() else []
     if role == "toolResult":
         text = content if isinstance(content, str) else _result_text(content)
         return [update_tool_call(m.get("toolCallId", ""), status="failed" if m.get("isError") else "completed",
@@ -323,7 +338,7 @@ def pi_updates(entry: dict) -> list:
             out.append(start_tool_call(b.get("id", ""), _tool_title(name, args), kind=PI_TOOL_KIND.get(name, "other"),
                                        status="in_progress", raw_input=args))
     if m.get("stopReason") not in (None, "toolUse"):  # stop, aborted, error, length: the turn is over
-        out.append(TURN_END)
+        out.append(Mark("end", entry.get("timestamp") or ""))
     return out
 
 
@@ -524,6 +539,8 @@ def _selfcheck() -> None:
         assert await r.poll() == []
         append(path, *lines, '{"type": "assistant", "message": {"content": [{"type": "text", "te')
         ups = await r.poll()
+        assert ups[5] == Mark("user", ""), ups  # every user message is followed by its Mark
+        ups = ups[:5]
         kinds = [u.session_update for u in ups]
         assert kinds == ["agent_thought_chunk", "agent_message_chunk", "tool_call", "tool_call_update", "user_message_chunk"], kinds
         assert ups[4].content.text == "typed by human"
@@ -539,6 +556,9 @@ def _selfcheck() -> None:
                {"type": "system", "subtype": "turn_duration", "isSidechain": True},
                {"type": "system", "subtype": "turn_duration"})
         assert await r.poll() == [TURN_END]
+        # Marks carry the entry's timestamp: the turn's order comes from them
+        assert updates_from_entry({"type": "system", "subtype": "turn_duration", "timestamp": "T2"}) == [Mark("end", "T2")]
+        assert updates_from_entry({"type": "user", "timestamp": "T1", "message": {"content": "hi"}})[1] == Mark("user", "T1")
 
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(go(tmp))
@@ -574,7 +594,7 @@ def _selfcheck() -> None:
             {"type": "SubAgentActivity", "id": "s1"},
         ]:
             f.write(json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": it}}) + "\n")
-    ups = asyncio.run(c.poll())
+    ups = [u for u in asyncio.run(c.poll()) if not isinstance(u, Mark)]
     assert [u.session_update for u in ups] == ["user_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
                                               "tool_call", "tool_call_update", "agent_message_chunk"], [u.session_update for u in ups]
     assert ups[2].title == "exec: pwd" and ups[3].content[0].content.text == "/work\n" and ups[4].title == "edit: a.py"
@@ -610,10 +630,10 @@ def _selfcheck() -> None:
         ]:
             f.write(json.dumps(row) + "\n")
     ups = asyncio.run(r.poll())
-    assert [u if u == TURN_END else u.session_update for u in ups] == [
-        "user_message_chunk", "agent_thought_chunk", "agent_message_chunk", "tool_call", "tool_call_update",
-        "agent_message_chunk", TURN_END], ups
-    assert ups[3].title == "bash: pwd" and ups[3].kind == "execute" and ups[4].content[0].content.text == "/work\n"
+    assert [u if isinstance(u, Mark) else u.session_update for u in ups] == [
+        "user_message_chunk", Mark("user", ""), "agent_thought_chunk", "agent_message_chunk", "tool_call",
+        "tool_call_update", "agent_message_chunk", TURN_END], ups
+    assert ups[4].title == "bash: pwd" and ups[4].kind == "execute" and ups[5].content[0].content.text == "/work\n"
     # OMP holds advisor side files open next to the session; they are not the session
     assert _is_pi_session("/h/.omp/agent/sessions/-w/2026_x.jsonl")
     assert not _is_pi_session("/h/.omp/agent/sessions/-w/2026_x/__advisor.scribe.jsonl")

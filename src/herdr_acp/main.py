@@ -30,6 +30,7 @@ from acp.schema import Implementation, PermissionOption, ToolCallUpdate
 from .reader import (
     DIALOG_HINT,
     TURN_END,
+    Mark,
     ClaudeTranscript,
     CodexRollout,
     PiSession,
@@ -66,11 +67,11 @@ class PaneAgent:
         self.can_ask = True  # False once the client failed a request_permission
         self.cancelled = False
         self.dismissed = False  # the client dismissed a dialog this turn: the turn ends cancelled
-        self.turn_starts = 0  # `starts` when the current turn's prompt went out
+        self.turn_base = 0  # len(self.marks) when the current turn's prompt went out
         # What the pane did, as counters the turn waits on (all advanced under `changed`):
         self.moves = 0  # updates read from the reader
-        self.starts = 0  # user messages among them (a typed prompt or a human's input)
-        self.ended = 0  # `starts` as of the latest TURN_END: a turn ended after that many user messages
+        self.starts = 0  # user messages recorded (a typed prompt or a human's input)
+        self.marks = []  # the reader's Marks (user messages, turn ends), in read order
         # Signs that a dialog was answered: tool results and turn ends (not a new tool call or text,
         # which Claude may write just after its dialog shows), and Herdr seeing the agent leave blocked.
         self.results = 0
@@ -146,16 +147,18 @@ class PaneAgent:
                 self.repick = False
             ups = await self.reader.poll()
             for u in ups:
-                if u == TURN_END:
-                    self.ended, self.results = self.starts, self.results + 1
+                if isinstance(u, Mark):
+                    self.marks.append(u)
+                    if u.kind == "end":
+                        self.results += 1
+                    else:
+                        self.starts += 1
                     continue
                 self.moves += 1
                 if u.session_update == "tool_call_update" and u.status in ("completed", "failed"):
                     self.results += 1
-                if u.session_update == "user_message_chunk":
-                    self.starts += 1
-                    if u.content.text.strip() in self.recent_prompts:
-                        continue
+                if u.session_update == "user_message_chunk" and u.content.text.strip() in self.recent_prompts:
+                    continue
                 await self.conn.session_update(self.session_id, u)
                 if u.session_update == "tool_call":
                     self.open_tool = u.tool_call_id
@@ -220,12 +223,22 @@ class PaneAgent:
         log.info("turn done (%s)", stop)
         return PromptResponse(stop_reason=stop)
 
+    def _turn_ended(self, base: int) -> bool:
+        """A turn end recorded for the first user message read since mark `base`: stamped no earlier
+        than it, or (no timestamps) read after it. A late end of an earlier, cancelled turn is
+        stamped before the new prompt, so it doesn't count, wherever it lands in the file."""
+        new = self.marks[base:]
+        user = next((i for i, m in enumerate(new) if m.kind == "user"), None)
+        if user is None:
+            return False
+        u = new[user]
+        return any(m.kind == "end" and (m.at >= u.at if m.at and u.at else i > user) for i, m in enumerate(new))
+
     async def _transcript_turn(self, text: str) -> str:
-        """Ends at the first TURN_END recorded after a user message read since the prompt (a late
-        marker from an earlier, cancelled turn doesn't count). A prompt that starts no turn (a
-        built-in slash command) records nothing: then Herdr's stall verdict ends it."""
+        """Ends at the turn end recorded for this prompt (`_turn_ended`). A prompt that starts no
+        turn (a built-in slash command) records nothing: then Herdr's stall verdict ends it."""
         starts, moves, stalled = self.starts, self.moves, False
-        self.turn_starts = starts
+        self.turn_base = base = len(self.marks)
 
         async def submit():
             nonlocal stalled
@@ -245,7 +258,7 @@ class PaneAgent:
         sent = asyncio.create_task(submit())
         dialogs = asyncio.create_task(self._dialogs())
         try:
-            await self._until(lambda: self.cancelled or self.ended > starts
+            await self._until(lambda: self.cancelled or self._turn_ended(base)
                               or (sent.done() and (sent.exception() or (stalled and self.moves == moves))))
             if sent.done() and sent.exception():
                 raise sent.exception()
@@ -332,7 +345,7 @@ class PaneAgent:
                 self.dismissed = True
                 await self._press(dialog, moved, lambda now: self.transport.send_keys("esc"))
                 await self._pump()
-                if getattr(self.reader, "kind", None) == "omp" and self.ended <= self.turn_starts:
+                if getattr(self.reader, "kind", None) == "omp" and not self._turn_ended(self.turn_base):
                     await self.transport.send_keys("esc")  # OMP: Esc only denied the tool and the turn goes on
                 self.cancelled = True  # session/cancel that follows sends no further Esc
                 await self._notify()
@@ -492,8 +505,11 @@ def _selfcheck() -> None:
             for t in a.tasks:
                 t.cancel()
 
-    def echo(pane):  # the prompt as the agent records it
-        return update_user_message_text(pane.sent[-1].strip())
+    def echo(pane, at=""):  # the prompt as the agent records it: the message, then its Mark
+        return update_user_message_text(pane.sent[-1].strip()), Mark("user", at)
+
+    def end(at=""):
+        return Mark("end", at)
 
     async def later(delay, fn):
         await asyncio.sleep(delay)
@@ -505,20 +521,35 @@ def _selfcheck() -> None:
 
         # (a) a turn ends at the transcript's TURN_END, not at Herdr's verdict; the echo isn't streamed
         async def answers(p):
-            asyncio.ensure_future(later(0.02, lambda: p.reader.push(echo(p), update_agent_message_text("hello"), TURN_END)))
+            asyncio.ensure_future(later(0.02, lambda: p.reader.push(*echo(p), update_agent_message_text("hello"), TURN_END)))
             return "done"  # Herdr settles before the transcript is read
         pane = Pane(on_prompt=answers)
         stop, a = await run(pane)
         assert stop == "end_turn" and said(a) == ["hello"] and pane.sent == ["hi\n\nreply here"], (stop, a.conn.ups)
 
-        # (b) a late TURN_END of an earlier (cancelled) turn doesn't end the new one
+        # (b) a late TURN_END of an earlier (cancelled) turn doesn't end the new one: read before
+        # the new prompt is recorded, or stamped before it
         async def stale_then_real(p):
             p.reader.push(TURN_END)
-            asyncio.ensure_future(later(0.03, lambda: p.reader.push(echo(p), update_agent_message_text("real"), TURN_END)))
+            asyncio.ensure_future(later(0.03, lambda: p.reader.push(*echo(p), update_agent_message_text("real"), TURN_END)))
             return "working"
         pane = Pane(on_prompt=stale_then_real)
         stop, a = await run(pane)
         assert stop == "end_turn" and said(a) == ["real"], (stop, said(a))
+        async def stale_stamped(p):
+            p.reader.push(*echo(p, "2026-10-01T10:00:02Z"), end("2026-10-01T10:00:01Z"))  # written late, stamped early
+            asyncio.ensure_future(later(0.03, lambda: p.reader.push(update_agent_message_text("real"), end("2026-10-01T10:00:03Z"))))
+            return "working"
+        stop, a = await run(Pane(on_prompt=stale_stamped))
+        assert stop == "end_turn" and said(a) == ["real"], (stop, said(a))
+        # under load an agent writes the turn's end before its user message (Claude, seen in CI): the
+        # timestamps still say whose end it is
+        async def reordered(p):
+            p.reader.push(update_agent_message_text("late echo"), end("2026-10-01T10:00:02Z"))
+            asyncio.ensure_future(later(0.02, lambda: p.reader.push(*echo(p, "2026-10-01T10:00:01Z"))))
+            return "done"
+        stop, a = await run(Pane(on_prompt=reordered))
+        assert stop == "end_turn" and said(a) == ["late echo"], (stop, said(a))
 
         # (c) Herdr stalls: nothing recorded → the prompt started no turn; a recorded prompt → wait for TURN_END
         async def stall(p):
@@ -526,7 +557,7 @@ def _selfcheck() -> None:
         stop, a = await run(Pane(on_prompt=stall), text="/cost")
         assert stop == "end_turn" and a.moves == 0, stop
         async def stall_but_working(p):  # OMP: Herdr never sees it work, the transcript does
-            p.reader.push(echo(p))
+            p.reader.push(*echo(p))
             asyncio.ensure_future(later(0.03, lambda: p.reader.push(update_agent_message_text("omp"), TURN_END)))
             raise HerdrError("agent_prompt_stalled", "no state change")
         stop, a = await run(Pane(agent="omp", on_prompt=stall_but_working))
@@ -562,7 +593,7 @@ def _selfcheck() -> None:
         # (e) a dialog goes to the client against the open tool call; the choice is typed once the
         # cursor is on it (cursor on 1, "3." chosen: 2 rows down, regex on the "3. No" row)
         async def tool_then_dialog(p):
-            p.reader.push(echo(p), start_tool_call("t1", "Bash: rm x", kind="execute", status="in_progress"))
+            p.reader.push(*echo(p), start_tool_call("t1", "Bash: rm x", kind="execute", status="in_progress"))
             asyncio.ensure_future(later(0.02, lambda: setattr(p, "screen", DIALOG)))
             return "blocked"
         async def rejected(p):

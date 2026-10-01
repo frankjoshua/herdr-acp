@@ -25,6 +25,14 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
     Enter again if not (`_type`, same bound as dialog keys).
   - Herdr's unblock count now needs an actual change from `blocked`: a stale `working` that
     arrived after a dialog showed made a lost key look taken.
+  - *GitHub's runners found a reordering:* Claude's first turn hung in 3 of 4 CI runs.
+    - On a busy machine Claude writes the reply and `turn_duration` to the file *before* the
+      user message, while each entry's timestamp is still in true order. Reproduced locally
+      with the suite pinned to one CPU (`taskset -c 0`): 2 of 4 runs.
+    - Readers now emit a `Mark` with the entry's timestamp for each user message and each turn
+      end. A turn ends at an end stamped no earlier than its first user message; entries
+      without timestamps fall back to read order.
+    - A cancelled turn's late end is stamped before the next prompt, so it still doesn't count.
 - **A live suite runs the installed agents against a fake provider** (2026-09-30).
   `tests/agents.py` gives each of Claude Code, Codex, OMP, Pi, Codex inside a tmux client, and a
   bare shell a pane on a private, headless Herdr server (`herdr --session hacp-agents-<pid> server`).
@@ -85,8 +93,10 @@ Design decisions and their reasons, dated. Buzz-specific notes live in the herdr
   - *Turn end = the agent's own record.* Claude writes `system/turn_duration` after every turn,
     including errors ("Login expired") and interrupts; Codex writes `task_complete` or
     `turn_aborted`; Pi/OMP end a turn with an assistant `stopReason` other than `toolUse`. Readers
-    emit `TURN_END` there. A turn ends at the first `TURN_END` read after a user message that
-    was itself read after the prompt, so a late marker from a cancelled turn doesn't end the next.
+    emit a timestamped `Mark` there and after every user message. A turn ends at the first end
+    stamped no earlier than the first user message recorded since the prompt (read order when
+    there are no timestamps), so a late end of a cancelled turn doesn't end the next one, and an
+    agent writing its lines out of order under load doesn't hang the turn.
   - *A prompt that starts no turn* (Claude's `/cost`) records nothing. Herdr's `agent.prompt`
     wait reports `agent_prompt_stalled` when it sees no lifecycle change for 5s. That stall, with
     nothing read from the transcript since the prompt, ends the turn. It is the one timer left,
