@@ -33,4 +33,3 @@ jobs:
               --body "Opened by the auto-merge workflow for \`$BRANCH\`; merges itself once the required checks pass."
       - name: Merge once the required checks pass
         run: gh pr merge "$BRANCH" --auto --squash  # the repo deletes merged branches
-        run: gh pr merge "$BRANCH" --auto --squash --delete-branch
