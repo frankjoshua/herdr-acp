@@ -130,10 +130,11 @@ class Herdr:
 
     async def select(self, steps: int, row: str, timeout_ms: int = 5000) -> None:
         """Move a TUI list's cursor `steps` rows (negative: up) and press Enter once the cursor row
-        matches the regex `row`. Raises HerdrError `timeout` (nothing pressed) if it never does."""
+        matches the regex `row`, also when no move was needed (someone may have moved it since).
+        Raises HerdrError `timeout` (nothing pressed) if it never does."""
         if steps:
             await self.send_keys(*["down" if steps > 0 else "up"] * abs(steps))
-            await self.wait_output(row, timeout_ms)
+        await self.wait_output(row, timeout_ms)
         await self.send_keys("enter")
 
     async def wait_output(self, regex: str, timeout_ms: int | None = None, lines: int = 25) -> str:
