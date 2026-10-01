@@ -24,6 +24,7 @@ from acp import (
     text_block,
     tool_content,
 )
+from acp.exceptions import RequestError
 from acp.schema import Implementation, PermissionOption, ToolCallUpdate
 
 from .reader import (
@@ -43,6 +44,12 @@ from .transport import Herdr, HerdrError
 log = logging.getLogger("herdr-acp")
 KNOWN = ("claude", "codex", "omp", "pi")  # agents with a transcript reader; anything else gets the screen diff
 POLL = 0.5  # how often the tail reads the transcript or screen, and a shell turn looks at its shell
+# A key sent the moment a dialog is drawn can be lost (Claude: 2 in 3 at 0s, none from 0.1s): the
+# dialog shows before it listens, and nothing tells when it starts to. A key the agent hasn't
+# acted on within KEY_TAKEN is pressed again, at most PRESSES times, and only while that same
+# dialog is still on screen with nothing moved on since.
+KEY_TAKEN = 1.0
+PRESSES = 3
 
 
 class PaneAgent:
@@ -58,11 +65,16 @@ class PaneAgent:
         self.open_tool = None  # id of the last streamed tool call that has not finished
         self.can_ask = True  # False once the client failed a request_permission
         self.cancelled = False
+        self.dismissed = False  # the client dismissed a dialog this turn: the turn ends cancelled
+        self.turn_starts = 0  # `starts` when the current turn's prompt went out
         # What the pane did, as counters the turn waits on (all advanced under `changed`):
         self.moves = 0  # updates read from the reader
         self.starts = 0  # user messages among them (a typed prompt or a human's input)
         self.ended = 0  # `starts` as of the latest TURN_END: a turn ended after that many user messages
-        self.unblocked = 0  # Herdr status changes to anything but blocked
+        # Signs that a dialog was answered: tool results and turn ends (not a new tool call or text,
+        # which Claude may write just after its dialog shows), and Herdr seeing the agent leave blocked.
+        self.results = 0
+        self.unblocked = 0
         self.repick = True  # the agent may have changed (Herdr said so): re-pick the reader on the next pass
         self.pumping = asyncio.Lock()  # one reader pass at a time
         self.changed = asyncio.Condition()
@@ -134,9 +146,11 @@ class PaneAgent:
             ups = await self.reader.poll()
             for u in ups:
                 if u == TURN_END:
-                    self.ended = self.starts
+                    self.ended, self.results = self.starts, self.results + 1
                     continue
                 self.moves += 1
+                if u.session_update == "tool_call_update" and u.status in ("completed", "failed"):
+                    self.results += 1
                 if u.session_update == "user_message_chunk":
                     self.starts += 1
                     if u.content.text.strip() in self.recent_prompts:
@@ -185,8 +199,10 @@ class PaneAgent:
         if self.footer:
             text += "\n\n" + self.footer
         self.recent_prompts = (self.recent_prompts + [text.strip()])[-5:]
-        self.cancelled = False
+        self.cancelled = self.dismissed = False
         self.agent, self.repick = (await self.transport.info()).get("agent"), True
+        if open_dialog := parse_dialog(await self.transport.read_visible()):  # typing now would land in it
+            raise RequestError.invalid_request({"reason": "the pane is waiting on a dialog", "dialog": open_dialog.question})
         await self._pump()  # picks the reader; anything already written belongs before this prompt
         if not isinstance(self.reader, ScreenDiff):
             stop = await self._transcript_turn(text)
@@ -203,6 +219,7 @@ class PaneAgent:
         marker from an earlier, cancelled turn doesn't count). A prompt that starts no turn (a
         built-in slash command) records nothing: then Herdr's stall verdict ends it."""
         starts, moves, stalled = self.starts, self.moves, False
+        self.turn_starts = starts
 
         async def submit():
             nonlocal stalled
@@ -226,7 +243,7 @@ class PaneAgent:
                               or (sent.done() and (sent.exception() or (stalled and self.moves == moves))))
             if sent.done() and sent.exception():
                 raise sent.exception()
-            return "cancelled" if self.cancelled else "end_turn"
+            return "cancelled" if self.cancelled or self.dismissed else "end_turn"
         finally:
             sent.cancel()
             dialogs.cancel()
@@ -265,26 +282,26 @@ class PaneAgent:
 
     async def _dialogs(self) -> None:
         """For the length of a turn: each dialog the screen shows goes to the client. A dialog is
-        over once the agent moves on (the transcript moves, or Herdr sees it leave blocked), so
-        one dialog is asked once."""
+        over once the agent shows it was answered (a tool result or turn end in the transcript, or
+        Herdr seeing it leave blocked), so one dialog is asked once."""
         try:
-            while self.can_ask and not self.cancelled:
+            while self.can_ask and not self.cancelled and not self.dismissed:
                 screen = await self.transport.wait_output(DIALOG_HINT)
                 await self._pump()
-                moves, unblocked = self.moves, self.unblocked
+                results, unblocked = self.results, self.unblocked
 
-                def over():
-                    return self.cancelled or self.moves > moves or self.unblocked > unblocked
+                def moved():
+                    return self.results > results or self.unblocked > unblocked
 
                 if dialog := parse_dialog(screen):
-                    await self._ask(dialog, over)
-                await self._until(over)
+                    await self._ask(dialog, moved)
+                await self._until(lambda: self.cancelled or self.dismissed or moved())
         except HerdrError as e:
             log.warning("dialogs: %s; left to the pane for this turn", e)
 
-    async def _ask(self, dialog, over) -> None:
-        """Put the dialog to the client and type its choice, unless it is over first (answered at
-        the pane). A client that can't answer leaves dialogs to the pane from then on."""
+    async def _ask(self, dialog, moved) -> None:
+        """Put the dialog to the client and type its choice, unless the agent moves on first
+        (answered at the pane). A client that can't answer leaves dialogs to the pane from then on."""
         if self.open_tool:  # the client already shows this tool call
             tool = ToolCallUpdate(tool_call_id=self.open_tool)
         else:
@@ -293,7 +310,7 @@ class PaneAgent:
         options = [PermissionOption(option_id=str(i), name=lb, kind=option_kind(lb)) for i, lb in enumerate(dialog.labels)]
         log.info("asking: %s %s", dialog.question, dialog.labels)
         req = asyncio.create_task(self.conn.request_permission(session_id=self.session_id, tool_call=tool, options=options))
-        gone = asyncio.create_task(self._until(over))
+        gone = asyncio.create_task(self._until(lambda: self.cancelled or moved()))
         try:
             await asyncio.wait([req, gone], return_when=asyncio.FIRST_COMPLETED)
             if not req.done():
@@ -305,20 +322,44 @@ class PaneAgent:
                 log.warning("request_permission failed, leaving dialogs to the pane: %s", e)
                 self.can_ask = False
                 return
-            if outcome.outcome != "selected":  # the client cancelled the turn: close the dialog and end it
-                await self.cancel(self.session_id)
+            if outcome.outcome != "selected":  # the client cancelled the turn: Esc closes the dialog, the turn ends
+                self.dismissed = True
+                await self._press(dialog, moved, lambda now: self.transport.send_keys("esc"))
+                await self._pump()
+                if self.ended <= self.turn_starts:  # Esc only denied the tool and the agent goes on (OMP): stop it
+                    await self.transport.send_keys("esc")
+                self.cancelled = True  # session/cancel that follows sends no further Esc
+                await self._notify()
                 return
             i = int(outcome.option_id)
-            now = parse_dialog(await self.transport.read_visible())
-            if over() or not now or now[:2] != dialog[:2]:
-                return  # answered at the pane meanwhile
-            await self.transport.select(i - now.cursor, cursor_on(now, i))
+            await self._press(dialog, moved, lambda now: self.transport.select(i - now.cursor, cursor_on(now, i), int(KEY_TAKEN * 1000)))
             log.info("answered: %s", dialog.labels[i])
         except HerdrError as e:
             log.warning("couldn't answer the dialog, left to the pane: %s", e)
         finally:
             req.cancel()
             gone.cancel()
+
+    async def _press(self, dialog, moved, press) -> None:
+        """`press(dialog now on screen)` until the agent takes it: the agent moves on or that
+        dialog leaves the screen. Pressed again only while it is still there unanswered."""
+        for attempt in range(PRESSES):
+            now = parse_dialog(await self.transport.read_visible())
+            # Read the transcript after the screen: a dialog identical to this one (OMP's next "Allow
+            # tool: bash") only shows once the previous tool's result is written, so it counts as moved.
+            await self._pump()
+            if moved() or not now or now[:2] != dialog[:2]:
+                return  # taken (or answered at the pane)
+            if attempt:
+                log.info("the dialog didn't take the key; pressing again")
+            try:
+                await press(now)
+                await asyncio.wait_for(self._until(moved), KEY_TAKEN)
+                return
+            except (asyncio.TimeoutError, HerdrError) as e:  # not taken, or the cursor never got there
+                if isinstance(e, HerdrError) and e.code != "timeout":
+                    raise
+        raise HerdrError("not_taken", f"the dialog ignored {PRESSES} presses")
 
 
 def main() -> None:
@@ -349,10 +390,11 @@ def _selfcheck() -> None:
         async def poll(self): out, self.queue = self.queue, []; return out
 
     class Pane:  # a scripted Herdr pane; `on_prompt`/`on_select` play the agent
-        def __init__(self, agent="claude", on_prompt=None, on_select=None):
+        def __init__(self, agent="claude", on_prompt=None, on_select=None, deaf=0):
             self.agent, self.on_prompt, self.on_select = agent, on_prompt, on_select
             self.screen, self.sent, self.keys, self.selected = "", [], [], []
             self.fg, self.events_q = [True], asyncio.Queue()
+            self.deaf = deaf  # how many dialog keys the agent drops (a dialog drawn before it listens)
         async def info(self): return {"pane_id": "fake", "agent": self.agent}
         async def process(self): return (1, self.agent)
         async def events(self):
@@ -365,10 +407,20 @@ def _selfcheck() -> None:
             self.sent.append(text)
             if self.on_prompt:
                 await self.on_prompt(self)
-        async def send_keys(self, *keys): self.keys += keys
-        async def select(self, steps, row):
+        def _deaf(self):
+            self.deaf -= 1
+            return self.deaf >= 0
+        async def send_keys(self, *keys):
+            self.keys += keys
+            if "esc" in keys and self.screen and not self._deaf():  # Esc on the dialog: closed, Herdr sees it unblock
+                self.screen = ""
+                self.events_q.put_nowait({"pane_id": "fake", "agent": self.agent, "agent_status": "idle"})
+                if self.agent != "omp":  # Claude and Codex end the turn there; OMP only denies the tool and goes on
+                    self.reader.push(TURN_END)
+        async def select(self, steps, row, timeout_ms=5000):
             self.selected.append((steps, row))
-            await self.on_select(self)
+            if not self._deaf():
+                await self.on_select(self)
         async def wait_output(self, regex, timeout_ms=None, lines=25):
             while not re.search(regex, self.screen, re.M):
                 await asyncio.sleep(0.001)
@@ -422,8 +474,8 @@ def _selfcheck() -> None:
         fn()
 
     async def go():
-        global POLL
-        POLL = 0.002
+        global POLL, KEY_TAKEN
+        POLL, KEY_TAKEN = 0.002, 0.05
 
         # (a) a turn ends at the transcript's TURN_END, not at Herdr's verdict; the echo isn't streamed
         async def answers(p):
@@ -454,7 +506,8 @@ def _selfcheck() -> None:
         stop, a = await run(Pane(agent="omp", on_prompt=stall_but_working))
         assert stop == "end_turn" and said(a) == ["omp"], said(a)
 
-        # (d) Herdr refuses a prompt while a dialog is open: the client gets the error
+        # (d) a prompt while a dialog is open is refused, nothing typed: by Herdr (its status says
+        # blocked) or by herdr-acp (the screen shows the dialog; Herdr's status can lag behind it)
         async def blocked(p):
             raise HerdrError("agent_blocked", "agent is blocked")
         try:
@@ -462,6 +515,13 @@ def _selfcheck() -> None:
             raise AssertionError("agent_blocked swallowed")
         except HerdrError as e:
             assert e.code == "agent_blocked", e
+        pane = Pane(on_prompt=lambda p: asyncio.Event().wait())
+        pane.screen = DIALOG
+        try:
+            await run(pane)
+            raise AssertionError("prompt typed into an open dialog")
+        except RequestError as e:
+            assert e.data["dialog"] == "Do you want to proceed?" and pane.sent == [], (e.data, pane.sent)
 
         # (e) a dialog goes to the client against the open tool call; the choice is typed once the
         # cursor is on it (cursor on 1, "3." chosen: 2 rows down, regex on the "3. No" row)
@@ -521,13 +581,37 @@ def _selfcheck() -> None:
         assert stop == "end_turn" and len(a.conn.asked) == 1 and not a.can_ask, a.conn.asked
 
         # (i) the client dismisses the request: one Esc, the turn ends cancelled; the session/cancel
-        # that follows sends no second Esc
+        # that follows sends no second Esc (two open Claude's rewind)
         async def dismissed():
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         pane = Pane(on_prompt=tool_then_dialog)
         stop, a = await run(pane, answer=dismissed)
         await a.cancel(a.session_id)
         assert stop == "cancelled" and pane.keys == ["esc"] and len(a.conn.asked) == 1, (stop, pane.keys)
+        # OMP: Esc only denies the tool and the turn goes on, so a second Esc stops it
+        pane = Pane(agent="omp", on_prompt=tool_then_dialog)
+        stop, a = await run(pane, answer=dismissed)
+        assert stop == "cancelled" and pane.keys == ["esc", "esc"], (stop, pane.keys)
+        # a dialog drawn before it listens drops the first key: pressed again, still asked once
+        pane = Pane(on_prompt=tool_then_dialog, deaf=1)
+        stop, a = await run(pane, answer=dismissed)
+        assert stop == "cancelled" and pane.keys == ["esc", "esc"] and len(a.conn.asked) == 1, (stop, pane.keys)
+        pane = Pane(on_prompt=tool_then_dialog, on_select=rejected, deaf=1)
+        stop, a = await run(pane, answer=pick_third)
+        assert stop == "end_turn" and len(pane.selected) == 2 and len(a.conn.asked) == 1, (pane.selected, a.conn.asked)
+        # a taken key is never pressed again, even when the next dialog looks the same (OMP's
+        # "Allow tool: bash"): its tool result is in the transcript before that dialog shows
+        async def next_same_dialog(p):
+            if len(p.selected) == 1:
+                p.reader.push(update_tool_call("t1", status="failed"))
+                p.screen = DIALOG  # the same question and options again, for the next call
+            else:
+                await rejected(p)
+        pane = Pane(on_prompt=tool_then_dialog, on_select=next_same_dialog)
+        POLL = 10.0  # the tail sleeps: only _press's own transcript read can see the tool result
+        stop, a = await run(pane, answer=pick_third)
+        POLL = 0.002
+        assert stop == "end_turn" and len(pane.selected) == 2 and len(a.conn.asked) == 2, (pane.selected, a.conn.asked)
 
         # (j) shell: not done while a command owns the terminal, nor while the shell (in the
         # foreground already) still shows only the typed command; done back at the prompt

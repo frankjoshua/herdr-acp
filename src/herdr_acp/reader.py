@@ -243,8 +243,8 @@ class CodexRollout:
         self.offset = os.path.getsize(self.path) if self.path else 0
 
     async def poll(self) -> list:
-        if not self.path:  # Codex holds the rollout open once it exists
-            self.path, self.offset = next(filter(_is_rollout, open_files(self.pid)), None), 0
+        if not self.path:  # created at the first turn; full discovery costs ~1ms
+            self.path, self.offset = codex_rollout_for(self.pid), 0
         if not self.path:
             return []
         out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, codex_updates)
@@ -334,8 +334,8 @@ class PiSession:
         self.offset = os.path.getsize(self.path) if self.path else 0
 
     async def poll(self) -> list:
-        if not self.path:  # the agent holds its session open once the first message exists
-            self.path, self.offset = next(filter(_is_pi_session, open_files(self.pid)), None), 0
+        if not self.path:  # created at the first turn and not held open yet (OMP); ~2ms
+            self.path, self.offset = pi_session_for(self.pid, self.kind), 0
         if not self.path:
             return []
         out, self.offset = _parse_lines(self.path, _new_lines(self.path, self.offset), self.offset, pi_updates)
