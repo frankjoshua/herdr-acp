@@ -151,7 +151,7 @@ class PaneAgent:
                     self.marks.append(u)
                     if u.kind == "end":
                         self.results += 1
-                    else:
+                    elif u.kind == "user":
                         self.starts += 1
                     continue
                 self.moves += 1
@@ -221,7 +221,29 @@ class PaneAgent:
             stop = await self._shell_turn(text)
         await self._pump()  # the turn's last lines go out before its answer
         log.info("turn done (%s)", stop)
-        return PromptResponse(stop_reason=stop)
+        usage = self._completed_codex_usage(self.turn_base) if stop == "end_turn" else None
+        return PromptResponse(stop_reason=stop, usage=usage)
+
+    def _completed_codex_usage(self, base: int):
+        """Return the latest explicit cumulative Codex usage for this completed native turn."""
+        if not isinstance(self.reader, CodexRollout):
+            return None
+        marks = self.marks[base:]
+        user_index = next((i for i, mark in enumerate(marks) if mark.kind == "user"), None)
+        if user_index is None:
+            return None
+        user = marks[user_index]
+        end = next((mark for i, mark in enumerate(marks)
+                    if mark.kind == "end"
+                    and (mark.at >= user.at if mark.at and user.at else i > user_index)), None)
+        # Match _turn_ended's first eligible marker before deciding whether that marker
+        # represents successful completion; never skip an abort to attach later-turn usage.
+        if not end or not end.completed or not end.turn_id:
+            return None
+        # turn_token_usage is already cumulative for this native turn: take its last matching
+        # snapshot once; never add reports or use a thread total.
+        return next((mark.usage for mark in reversed(marks)
+                     if mark.kind == "usage" and mark.turn_id == end.turn_id), None)
 
     def _turn_ended(self, base: int) -> bool:
         """A turn end recorded for the first user message read since mark `base`: stamped no earlier
@@ -412,6 +434,7 @@ def main() -> None:
 
 def _selfcheck() -> None:
     """Turn ends and dialog answering against a scripted pane; no Herdr needed."""
+    import json
     import re
 
     from acp import start_tool_call, update_agent_message_text, update_tool_call, update_user_message_text
@@ -471,7 +494,7 @@ def _selfcheck() -> None:
     class Agent(PaneAgent):  # the script's reader (shared with the pane script) instead of a real transcript
         async def _pick_reader(self):
             p = self.transport
-            self.reader = self.reader or (Reader(p.agent) if p.agent in KNOWN else ScreenDiff(p.read_screen))
+            self.reader = self.reader or getattr(p, "reader", None) or (Reader(p.agent) if p.agent in KNOWN else ScreenDiff(p.read_screen))
             p.reader = self.reader
 
     class Conn:
@@ -550,6 +573,90 @@ def _selfcheck() -> None:
             return "done"
         stop, a = await run(Pane(on_prompt=reordered))
         assert stop == "end_turn" and said(a) == ["late echo"], (stop, said(a))
+
+        # The real Codex reader feeds a typed ACP response with only the final matching
+        # cumulative turn snapshot. The fixture uses actual field names/counts and sanitized IDs.
+        import tempfile
+        from .reader import CodexRollout
+        from acp.schema import Usage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "rollout.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({"type": "session_meta", "payload": {"cwd": "/work"}}) + "\n")
+            codex_reader = CodexRollout(1, path=path)
+            call_number = 0
+
+            def append_rows(rows):
+                with open(path, "a") as f:
+                    f.write("".join(json.dumps(row) + "\n" for row in rows))
+
+            def usage_row(turn, response, response_usage, cumulative, thread):
+                return {"type": "token_usage_record", "payload": {
+                    "thread_id": "thread-fixture", "turn_id": turn, "response_id": response,
+                    "usage": response_usage,
+                    "turn_token_usage": cumulative, "thread_token_usage": thread,
+                }}
+
+            async def codex_reply(p):
+                nonlocal call_number
+                call_number += 1
+                turn = f"turn-{call_number}"
+                user = {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                    "type": "UserMessage", "id": f"user-{call_number}",
+                    "content": [{"type": "text", "text": p.sent[-1]}],
+                }}}
+                complete = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn}}
+                first = {"input_tokens": 17468, "cached_input_tokens": 12032, "cache_write_input_tokens": 0,
+                         "output_tokens": 59, "reasoning_output_tokens": 0, "total_tokens": 17527}
+                second = {"input_tokens": 17584, "cached_input_tokens": 17408, "cache_write_input_tokens": 0,
+                          "output_tokens": 16, "reasoning_output_tokens": 9, "total_tokens": 17600}
+                final = {"input_tokens": 35052, "cached_input_tokens": 29440, "cache_write_input_tokens": 0,
+                         "output_tokens": 75, "reasoning_output_tokens": 9, "total_tokens": 35127}
+                thread = {"input_tokens": 101585, "cached_input_tokens": 90752, "cache_write_input_tokens": 0,
+                          "output_tokens": 191, "reasoning_output_tokens": 9, "total_tokens": 101776}
+                if call_number == 1:
+                    rows = [usage_row("other-turn", "other-response", thread, thread, thread), user,
+                            usage_row(turn, "response-1", first, first, first),
+                            usage_row(turn, "response-2", second, final, thread),
+                            usage_row(turn, "response-2-duplicate", second, final, thread), complete]
+                elif call_number == 2:
+                    rows = [user, usage_row(turn, "response-partial", first, first, thread),
+                            {"type": "token_usage_record", "payload": {
+                                "thread_id": "thread-fixture", "turn_id": turn,
+                                "usage": {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+                                "turn_token_usage": {"input_tokens": "invalid", "output_tokens": 1, "total_tokens": 11},
+                                "thread_token_usage": thread,
+                            }}, complete]
+                elif call_number == 3:
+                    rows = [user, complete]  # missing usage must not inherit an earlier turn
+                else:
+                    aborted = {"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": turn}}
+                    other = "later-unrelated-turn"
+                    rows = [user, usage_row(turn, "aborted-response", final, final, thread), aborted,
+                            usage_row(other, "later-response", thread, thread, thread),
+                            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": other}}]
+                append_rows(rows)
+                return "done"
+
+            pane = Pane(agent="codex", on_prompt=codex_reply)
+            pane.reader = codex_reader
+            a = Agent(pane, footer="")
+            a.on_connect(Conn())
+            sid = (await a.new_session("/tmp")).session_id
+            response = await a.prompt(sid, [text_block("sample")])
+            assert isinstance(response, PromptResponse) and type(response.usage) is Usage, response
+            assert (response.usage.input_tokens, response.usage.output_tokens,
+                    response.usage.total_tokens) == (35052, 75, 35127), response.usage
+            assert (response.usage.cached_read_tokens, response.usage.cached_write_tokens,
+                    response.usage.thought_tokens) == (29440, 0, 9), response.usage
+            assert (a.starts, a.results, a.moves, a.conn.ups) == (1, 1, 1, []), (
+                a.starts, a.results, a.moves, a.conn.ups)
+            for prompt in ("sample two", "sample three", "sample four"):
+                response = await a.prompt(sid, [text_block(prompt)])
+                assert isinstance(response, PromptResponse) and response.usage is None, response
+            for t in a.tasks:
+                t.cancel()
 
         # (c) Herdr stalls: nothing recorded → the prompt started no turn; a recorded prompt → wait for TURN_END
         async def stall(p):
