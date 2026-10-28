@@ -27,6 +27,7 @@ from acp import (
     update_tool_call,
     update_user_message_text,
 )
+from acp.schema import Usage
 
 log = logging.getLogger("herdr-acp")
 PROC = "/proc"  # discovery is process-first (env, cwd, open files); the only glob is the cwd-scoped
@@ -34,12 +35,16 @@ PROC = "/proc"  # discovery is process-first (env, cwd, open files); the only gl
 
 
 class Mark(NamedTuple):
-    """In a reader's updates: the agent recorded a user message ("user") or the end of a turn
-    ("end"), at the entry's ISO timestamp ("" if it had none). Agents can write a turn's lines out
-    of order under load (Claude wrote its reply and turn end before the user message), so which
-    turn an end belongs to is decided by time, not by where it sits in the file."""
+    """Private transcript markers: user/end ordering plus Codex completion-scoped usage.
+
+    Agents can write a turn's lines out of order under load (Claude wrote its reply and turn end
+    before the user message), so which end belongs to a turn is decided by time, not file order.
+    """
     kind: str
     at: str
+    turn_id: str | None = None
+    usage: Usage | None = None
+    completed: bool = False
 
 
 TURN_END = Mark("end", "")
@@ -204,10 +209,34 @@ def _item_text(content) -> str:
 
 
 def codex_updates(entry: dict) -> list:
-    """Map one rollout line to ACP updates (only `item_completed` events carry anything)."""
+    """Map one rollout line to ACP updates and private, turn-keyed usage markers."""
     p = entry.get("payload") or {}
     if entry.get("type") == "event_msg" and p.get("type") in ("task_complete", "turn_aborted"):
-        return [Mark("end", entry.get("timestamp") or "")]
+        return [Mark("end", entry.get("timestamp") or "", p.get("turn_id"),
+                     completed=p.get("type") == "task_complete")]
+    if entry.get("type") == "token_usage_record":
+        turn_id = p.get("turn_id")
+        if not isinstance(turn_id, str) or not turn_id:
+            return []
+        counts = p.get("turn_token_usage")
+        usage = None
+        if isinstance(counts, dict):
+            fields = (("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"),
+                      ("total_tokens", "totalTokens"))
+            optional = (("reasoning_output_tokens", "thoughtTokens"),
+                        ("cached_input_tokens", "cachedReadTokens"),
+                        ("cache_write_input_tokens", "cachedWriteTokens"))
+            values = {target: counts.get(source) for source, target in fields}
+            valid = all(type(value) is int and value >= 0 for value in values.values())
+            for source, target in optional:
+                if source in counts:
+                    values[target] = counts[source]
+                    valid = valid and type(values[target]) is int and values[target] >= 0
+            if valid:
+                usage = Usage(**values)
+        # Keep even an invalid later snapshot as an omission marker, so an earlier partial
+        # snapshot for this turn cannot be mistaken for the completed total.
+        return [Mark("usage", entry.get("timestamp") or "", turn_id, usage)]
     if entry.get("type") != "event_msg" or p.get("type") != "item_completed":
         return []
     it = p.get("item") or {}
@@ -598,8 +627,36 @@ def _selfcheck() -> None:
     assert [u.session_update for u in ups] == ["user_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
                                               "tool_call", "tool_call_update", "agent_message_chunk"], [u.session_update for u in ups]
     assert ups[2].title == "exec: pwd" and ups[3].content[0].content.text == "/work\n" and ups[4].title == "edit: a.py"
-    for end in ("task_complete", "turn_aborted"):  # a finished turn, a rejected one
-        assert codex_updates({"type": "event_msg", "payload": {"type": end}}) == [TURN_END], end
+    # Codex's top-level token_usage_record holds explicit per-response usage and a cumulative
+    # turn_token_usage snapshot. Keep the actual shape, but use synthetic local identifiers.
+    thread_id, turn_id = "thread-fixture", "turn-fixture"
+    def token_record(response_id, response, turn):
+        return {"type": "token_usage_record", "payload": {
+            "thread_id": thread_id, "turn_id": turn_id, "response_id": response_id,
+            "usage": response, "turn_token_usage": turn,
+            "thread_token_usage": {"input_tokens": 35052, "output_tokens": 75, "total_tokens": 35127},
+        }}
+    first = {"input_tokens": 17468, "cached_input_tokens": 12032, "cache_write_input_tokens": 0,
+             "output_tokens": 59, "reasoning_output_tokens": 0, "total_tokens": 17527}
+    second = {"input_tokens": 17584, "cached_input_tokens": 17408, "cache_write_input_tokens": 0,
+              "output_tokens": 16, "reasoning_output_tokens": 9, "total_tokens": 17600}
+    final = {"input_tokens": 35052, "cached_input_tokens": 29440, "cache_write_input_tokens": 0,
+             "output_tokens": 75, "reasoning_output_tokens": 9, "total_tokens": 35127}
+    first_mark = codex_updates(token_record("response-1", first, first))[0]
+    final_mark = codex_updates(token_record("response-2", second, final))[0]
+    duplicate_mark = codex_updates(token_record("response-2-duplicate", second, final))[0]
+    assert [m.usage.input_tokens for m in (first_mark, final_mark, duplicate_mark)] == [17468, 35052, 35052]
+    assert duplicate_mark.usage.total_tokens == 35127  # snapshots replace; they are never added
+    assert (final_mark.usage.cached_read_tokens, final_mark.usage.cached_write_tokens,
+            final_mark.usage.thought_tokens) == (29440, 0, 9)
+    assert codex_updates({"type": "token_usage_record", "payload": {"turn_id": turn_id}})[0].usage is None
+    invalid = dict(final, input_tokens="35052")
+    assert codex_updates(token_record("response-invalid", second, invalid))[0].usage is None
+    assert codex_updates(token_record("response-invalid-negative", second, dict(final, total_tokens=-1)))[0].usage is None
+    completed = codex_updates({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-current"}})
+    assert completed == [Mark("end", "", "turn-current", completed=True)], completed
+    aborted = codex_updates({"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": "turn-current"}})
+    assert aborted == [Mark("end", "", "turn-current")], aborted
     assert codex_updates({"type": "event_msg", "payload": {"type": "task_started"}}) == []
     # Pi/OMP: session found by cwd under the agent dir, message roles → updates
     home = tempfile.mkdtemp()
