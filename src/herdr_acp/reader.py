@@ -224,7 +224,11 @@ def codex_updates(entry: dict) -> list:
     if kind == "CommandExecution":
         cmd = it.get("command") or []
         cmd = cmd[2] if len(cmd) == 3 and cmd[1] in ("-lc", "-c") else " ".join(cmd)
-        out = (it.get("stdout") or "")[:4000]
+        out = it.get("stdout")
+        if out is None:
+            out = it.get("aggregated_output")
+        out = out if isinstance(out, str) else ""
+        out = out[:4000]
         failed = it.get("status") == "failed" or (it.get("exit_code") not in (None, 0))
         return [start_tool_call(iid, f"exec: {cmd[:120]}", kind="execute", status="in_progress", raw_input={"command": cmd}),
                 update_tool_call(iid, status="failed" if failed else "completed",
@@ -584,11 +588,17 @@ def _selfcheck() -> None:
     assert codex_rollout("/work", home, newer_than=2e10) is None  # older than the process: not ours
     c = CodexRollout(0, path=os.path.join(d, "rollout-2-b.jsonl"))
     assert asyncio.run(c.poll()) == []
+    long_output = "x" * 4001
     with open(c.path, "a") as f:
         for it in [
             {"type": "UserMessage", "id": "u1", "content": [{"type": "text", "text": "run pwd"}]},
             {"type": "Reasoning", "id": "r1", "summary_text": ["thinking"]},
             {"type": "CommandExecution", "id": "e1", "command": ["/bin/bash", "-lc", "pwd"], "status": "completed", "exit_code": 0, "stdout": "/work\n"},
+            {"type": "CommandExecution", "id": "e2", "command": ["/bin/bash", "-lc", "fixture"], "status": "completed", "exit_code": 0, "aggregated_output": "fixture output\n"},
+            {"type": "CommandExecution", "id": "e3", "command": ["/bin/bash", "-lc", "empty"], "status": "completed", "exit_code": 0, "aggregated_output": ""},
+            {"type": "CommandExecution", "id": "e4", "command": ["/bin/bash", "-lc", "missing"], "status": "completed", "exit_code": 0},
+            {"type": "CommandExecution", "id": "e5", "command": ["/bin/bash", "-lc", "large"], "status": "completed", "exit_code": 0, "aggregated_output": long_output},
+            {"type": "CommandExecution", "id": "e6", "command": ["/bin/bash", "-lc", "failed"], "status": "failed", "exit_code": 1, "aggregated_output": "fixture error\n"},
             {"type": "FileChange", "id": "f1", "changes": {"/work/a.py": {"type": "update"}}},
             {"type": "AgentMessage", "id": "m1", "content": [{"type": "Text", "text": "done"}]},
             {"type": "SubAgentActivity", "id": "s1"},
@@ -596,8 +606,23 @@ def _selfcheck() -> None:
             f.write(json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": it}}) + "\n")
     ups = [u for u in asyncio.run(c.poll()) if not isinstance(u, Mark)]
     assert [u.session_update for u in ups] == ["user_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
-                                              "tool_call", "tool_call_update", "agent_message_chunk"], [u.session_update for u in ups]
-    assert ups[2].title == "exec: pwd" and ups[3].content[0].content.text == "/work\n" and ups[4].title == "edit: a.py"
+                                              "tool_call", "tool_call_update", "tool_call", "tool_call_update",
+                                              "tool_call", "tool_call_update", "tool_call", "tool_call_update",
+                                              "tool_call", "tool_call_update",
+                                              "tool_call", "tool_call_update",
+                                              "agent_message_chunk"], [u.session_update for u in ups]
+    assert ups[2].tool_call_id == "e1" and ups[2].title == "exec: pwd" and ups[2].kind == "execute" and ups[2].status == "in_progress"
+    assert ups[3].tool_call_id == "e1" and ups[3].status == "completed" and ups[3].content[0].content.text == "/work\n"
+    assert ups[4].tool_call_id == "e2" and ups[4].title == "exec: fixture" and ups[4].kind == "execute"
+    assert ups[5].tool_call_id == "e2" and ups[5].status == "completed" and ups[5].content[0].content.text == "fixture output\n"
+    assert ups[6].tool_call_id == "e3" and ups[6].title == "exec: empty" and ups[6].status == "in_progress"
+    assert ups[7].tool_call_id == "e3" and ups[7].status == "completed" and ups[7].content is None
+    assert ups[8].tool_call_id == "e4" and ups[8].title == "exec: missing" and ups[8].status == "in_progress"
+    assert ups[9].tool_call_id == "e4" and ups[9].status == "completed" and ups[9].content is None
+    assert ups[10].title == "exec: large" and len(ups[11].content[0].content.text) == 4000
+    assert ups[12].tool_call_id == "e6" and ups[12].title == "exec: failed" and ups[12].status == "in_progress"
+    assert ups[13].tool_call_id == "e6" and ups[13].status == "failed" and ups[13].content[0].content.text == "fixture error\n"
+    assert ups[14].title == "edit: a.py"
     for end in ("task_complete", "turn_aborted"):  # a finished turn, a rejected one
         assert codex_updates({"type": "event_msg", "payload": {"type": end}}) == [TURN_END], end
     assert codex_updates({"type": "event_msg", "payload": {"type": "task_started"}}) == []
