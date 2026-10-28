@@ -594,7 +594,7 @@ def _selfcheck() -> None:
             {"type": "UserMessage", "id": "u1", "content": [{"type": "text", "text": "run pwd"}]},
             {"type": "Reasoning", "id": "r1", "summary_text": ["thinking"]},
             {"type": "CommandExecution", "id": "e1", "command": ["/bin/bash", "-lc", "pwd"], "status": "completed", "exit_code": 0, "stdout": "/work\n"},
-            {"type": "CommandExecution", "id": "e2", "command": ["/bin/bash", "-lc", "fixture"], "status": "completed", "exit_code": 0, "aggregated_output": "fixture output\n"},
+            {"type": "CommandExecution", "id": "e2", "command": ["/bin/bash", "-lc", "print(42)"], "status": "completed", "exit_code": 0, "aggregated_output": "42\n"},
             {"type": "CommandExecution", "id": "e3", "command": ["/bin/bash", "-lc", "empty"], "status": "completed", "exit_code": 0, "aggregated_output": ""},
             {"type": "CommandExecution", "id": "e4", "command": ["/bin/bash", "-lc", "missing"], "status": "completed", "exit_code": 0},
             {"type": "CommandExecution", "id": "e5", "command": ["/bin/bash", "-lc", "large"], "status": "completed", "exit_code": 0, "aggregated_output": long_output},
@@ -613,8 +613,8 @@ def _selfcheck() -> None:
                                               "agent_message_chunk"], [u.session_update for u in ups]
     assert ups[2].tool_call_id == "e1" and ups[2].title == "exec: pwd" and ups[2].kind == "execute" and ups[2].status == "in_progress"
     assert ups[3].tool_call_id == "e1" and ups[3].status == "completed" and ups[3].content[0].content.text == "/work\n"
-    assert ups[4].tool_call_id == "e2" and ups[4].title == "exec: fixture" and ups[4].kind == "execute"
-    assert ups[5].tool_call_id == "e2" and ups[5].status == "completed" and ups[5].content[0].content.text == "fixture output\n"
+    assert ups[4].tool_call_id == "e2" and ups[4].title == "exec: print(42)" and ups[4].kind == "execute"
+    assert ups[5].tool_call_id == "e2" and ups[5].status == "completed" and ups[5].content[0].content.text == "42\n"
     assert ups[6].tool_call_id == "e3" and ups[6].title == "exec: empty" and ups[6].status == "in_progress"
     assert ups[7].tool_call_id == "e3" and ups[7].status == "completed" and ups[7].content is None
     assert ups[8].tool_call_id == "e4" and ups[8].title == "exec: missing" and ups[8].status == "in_progress"
